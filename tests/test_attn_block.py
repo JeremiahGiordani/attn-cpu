@@ -1,7 +1,7 @@
 # tests/test_mha_block_vs_torch.py
 import torch, numpy as np
 import torch.nn as nn
-from python.mha_np import mha_forward_dense
+from attn_cpu.mha_np import mha_forward_dense
 
 def run_case(D=128, H=8, T=64, causal=False, seed=0):
     torch.manual_seed(seed)

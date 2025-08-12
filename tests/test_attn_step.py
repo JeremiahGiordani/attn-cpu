@@ -6,8 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# If you haven't pip-installed the module, point to your build dir:
-# export PYTHONPATH=$PWD/build:$PYTHONPATH
 import attn_cpu
 
 

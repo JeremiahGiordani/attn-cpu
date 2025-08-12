@@ -156,7 +156,7 @@ py::array_t<float> mha_block_dense_py(
     return y;
 }
 
-PYBIND11_MODULE(attn_cpu, m) {
+PYBIND11_MODULE(_attn_cpu, m) {
     m.doc() = "CPU Dense Attention (step + block)";
     m.def("attn_step_dense", &attn_step_dense_py, "Step dense attention");
     m.def("attn_block_dense", &attn_block_dense_py, py::arg("Q"), py::arg("K"),

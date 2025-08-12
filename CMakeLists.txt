@@ -58,6 +58,7 @@ if (ATTN_BUILD_PYTHON)
 
   # Put the built .so in the build/ directory root (optional)
   set_target_properties(attn_cpu PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME "_attn_cpu"
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/python/attn_cpu"
   )
 endif()

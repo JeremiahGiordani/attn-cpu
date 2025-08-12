@@ -2,3 +2,5 @@ env/
 build/
 .vscode/
 *.pyc
+*.so
+__pycache__/
