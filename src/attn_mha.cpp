@@ -1,445 +1,549 @@
 #include "attn.h"
-
 #include <immintrin.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace attn {
 
-//=============================
-// AVX-512 helpers
-//=============================
-#if defined(ATTN_USE_AVX512)
-static inline float hsum_ps(__m512 v) { return _mm512_reduce_add_ps(v); }
-static inline float hmax_ps(__m512 v) { return _mm512_reduce_max_ps(v); }
-
-// Fast exp(x) for __m512 (sufficient for softmax)
-static inline __m512 exp512_ps(__m512 x) {
-  const __m512 exp_hi = _mm512_set1_ps(88.3762626647949f);
-  const __m512 exp_lo = _mm512_set1_ps(-88.3762626647949f);
-  const __m512 log2ef = _mm512_set1_ps(1.44269504088896341f);
-  const __m512 c1 = _mm512_set1_ps(0.693359375f);
-  const __m512 c2 = _mm512_set1_ps(-2.12194440e-4f);
-
-  const __m512 p0 = _mm512_set1_ps(1.9875691500e-4f);
-  const __m512 p1 = _mm512_set1_ps(1.3981999507e-3f);
-  const __m512 p2 = _mm512_set1_ps(8.3334519073e-3f);
-  const __m512 p3 = _mm512_set1_ps(4.1665795894e-2f);
-  const __m512 p4 = _mm512_set1_ps(1.6666665459e-1f);
-  const __m512 p5 = _mm512_set1_ps(5.0000001201e-1f);
-
-  x = _mm512_min_ps(x, exp_hi);
-  x = _mm512_max_ps(x, exp_lo);
-
-  __m512 fx = _mm512_fmadd_ps(x, log2ef, _mm512_set1_ps(0.5f));
-  fx = _mm512_floor_ps(fx);
-
-  __m512 tmp = _mm512_fnmadd_ps(fx, c1, x);
-  x = _mm512_fnmadd_ps(fx, c2, tmp);
-
-  __m512 z = _mm512_mul_ps(x, x);
-  __m512 y = p0;
-  y = _mm512_fmadd_ps(y, x, p1);
-  y = _mm512_fmadd_ps(y, x, p2);
-  y = _mm512_fmadd_ps(y, x, p3);
-  y = _mm512_fmadd_ps(y, x, p4);
-  y = _mm512_fmadd_ps(y, x, p5);
-  y = _mm512_fmadd_ps(y, z, x);
-  y = _mm512_add_ps(y, _mm512_set1_ps(1.0f));
-
-  __m512i emm0 = _mm512_cvttps_epi32(fx);
-  emm0 = _mm512_add_epi32(emm0, _mm512_set1_epi32(127));
-  emm0 = _mm512_slli_epi32(emm0, 23);
-  __m512 pow2n = _mm512_castsi512_ps(emm0);
-  return _mm512_mul_ps(y, pow2n);
-}
-#else
-#error "This file expects AVX-512 enabled (ATTN_USE_AVX512)."
+#if !defined(ATTN_USE_AVX512)
+#error "Compile with ATTN_USE_AVX512 and AVX-512 flags."
 #endif
 
-//=============================
-// Weight packing for GEMM
-// We compute Y[M,N] = X[M,K] * Wt[K,N] + bias[N].
-// We pack Wt by blocks of N16=16 columns, K16=16 depth, laid out so that
-// for each 16-depth slice we can broadcast X[m,k..k+15] scalars and FMA into 16 output lanes.
-//=============================
-static constexpr int N16 = 16;
-static constexpr int K16 = 16;
+// --------- AVX-512 helpers ----------
+static inline float hsum_ps(__m512 v) {
+    return _mm512_reduce_add_ps(v);
+}
+static inline float hmax_ps(__m512 v) {
+    return _mm512_reduce_max_ps(v);
+}
 
-// dst size: round_up(N,16) * round_up(K,16)
-static inline void pack_wt_col16_k16(const float* Wt, int K, int N, std::vector<float>& packed) {
-  const int Np = (N + N16 - 1) / N16 * N16;
-  const int Kp = (K + K16 - 1) / K16 * K16;
-  packed.assign((size_t)Np * (size_t)Kp, 0.0f);
+// Fast exp for softmax
+static inline __m512 exp512_ps(__m512 x) {
+    const __m512 exp_hi = _mm512_set1_ps(88.3762626647949f);
+    const __m512 exp_lo = _mm512_set1_ps(-88.3762626647949f);
+    const __m512 log2ef = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f);
+    const __m512 c2 = _mm512_set1_ps(-2.12194440e-4f);
 
-  for (int n0 = 0; n0 < N; n0 += N16) {
-    const int n_take = std::min(N16, N - n0);
-    for (int k0 = 0; k0 < K; k0 += K16) {
-      const int k_take = std::min(K16, K - k0);
-      float* dst = packed.data() + (size_t)n0 * Kp + (size_t)k0 * Np;
-      // dst layout for this tile: K16 "planes" of 16 columns (N-major inside)
-      for (int kk = 0; kk < k_take; ++kk) {
-        float* dst_plane = dst + (size_t)kk * Np;
-        for (int nn = 0; nn < n_take; ++nn) {
-          dst_plane[nn] = Wt[(k0 + kk) * N + (n0 + nn)];
+    const __m512 p0 = _mm512_set1_ps(1.9875691500e-4f);
+    const __m512 p1 = _mm512_set1_ps(1.3981999507e-3f);
+    const __m512 p2 = _mm512_set1_ps(8.3334519073e-3f);
+    const __m512 p3 = _mm512_set1_ps(4.1665795894e-2f);
+    const __m512 p4 = _mm512_set1_ps(1.6666665459e-1f);
+    const __m512 p5 = _mm512_set1_ps(5.0000001201e-1f);
+
+    x = _mm512_min_ps(x, exp_hi);
+    x = _mm512_max_ps(x, exp_lo);
+
+    __m512 fx = _mm512_fmadd_ps(x, log2ef, _mm512_set1_ps(0.5f));
+    fx = _mm512_floor_ps(fx);
+
+    __m512 tmp = _mm512_fnmadd_ps(fx, c1, x);
+    x = _mm512_fnmadd_ps(fx, c2, tmp);
+
+    __m512 z = _mm512_mul_ps(x, x);
+    __m512 y = p0;
+    y = _mm512_fmadd_ps(y, x, p1);
+    y = _mm512_fmadd_ps(y, x, p2);
+    y = _mm512_fmadd_ps(y, x, p3);
+    y = _mm512_fmadd_ps(y, x, p4);
+    y = _mm512_fmadd_ps(y, x, p5);
+    y = _mm512_fmadd_ps(y, z, x);
+    y = _mm512_add_ps(y, _mm512_set1_ps(1.0f));
+
+    __m512i emm0 = _mm512_cvttps_epi32(fx);
+    emm0 = _mm512_add_epi32(emm0, _mm512_set1_epi32(127));
+    emm0 = _mm512_slli_epi32(emm0, 23);
+    __m512 pow2n = _mm512_castsi512_ps(emm0);
+    return _mm512_mul_ps(y, pow2n);
+}
+
+// --------- 16×16 packing (K,N multiples of 16) ----------
+static inline void pack_wt_16x16(const float *Wt, int K, int N,
+                                 std::vector<float> &packed) {
+    if ((K % 16) || (N % 16))
+        throw std::runtime_error("pack_wt_16x16: K,N must be multiples of 16");
+    const int nb = N / 16, kb = K / 16;
+    packed.resize((size_t)nb * kb * 256);
+    size_t idx = 0;
+    for (int nb_i = 0; nb_i < nb; ++nb_i) {
+        const int n0 = nb_i * 16;
+        for (int kb_i = 0; kb_i < kb; ++kb_i) {
+            const int k0 = kb_i * 16;
+            for (int kk = 0; kk < 16; ++kk) {
+                const float *src = Wt + (size_t)(k0 + kk) * N + n0;
+                std::memcpy(&packed[idx], src, 16 * sizeof(float));
+                idx += 16;
+            }
         }
-      }
     }
-  }
 }
 
-static inline void pack_wt_16x16(const float* Wt, int K, int N, std::vector<float>& packed) {
-  // Preconditions for our fast path
-  if ((K % 16) != 0 || (N % 16) != 0) {
-    throw std::runtime_error("pack_wt_16x16 requires K and N multiples of 16");
-  }
-  const int nb = N / 16;  // number of 16-col tiles
-  const int kb = K / 16;  // number of 16-depth tiles
-  packed.resize((size_t)nb * (size_t)kb * 256);
+// --------- GEMM microkernels (N multiple of 16, K multiple of 16) ----------
 
-  size_t idx = 0;
-  for (int nb_i = 0; nb_i < nb; ++nb_i) {
-    const int n0 = nb_i * 16;
-    for (int kb_i = 0; kb_i < kb; ++kb_i) {
-      const int k0 = kb_i * 16;
-      // Copy the 16x16 block: rows over kk, each row 16 contiguous cols
-      for (int kk = 0; kk < 16; ++kk) {
-        const float* src = Wt + (size_t)(k0 + kk) * N + n0;
-        std::memcpy(&packed[idx], src, 16 * sizeof(float));
-        idx += 16;
-      }
-    }
-  }
-}
-
-// =============================
-// GEMM microkernel for a single output row y[0..N)
-// X row length K (multiple of 16), N multiple of 16.
-// packedWt must be produced by pack_wt_16x16(Wt, K, N).
-// =============================
-static inline void gemm_row_packed_16x16(const float* x,
-                                         const float* packedWt,
-                                         const float* bias,
-                                         int K, int N,
-                                         float* y) {
-  const int nb = N / 16;
-  const int kb = K / 16;
-
-  for (int nb_i = 0; nb_i < nb; ++nb_i) {
-    // acc = bias[nb_i*16 .. nb_i*16+15]
-    __m512 acc = _mm512_loadu_ps(bias + nb_i * 16);
-
-    // Base offset for this N-tile (nb_i)
-    const size_t base_nb = (size_t)nb_i * (size_t)kb * 256; // kb tiles, each 256 floats
-
-    for (int kb_i = 0; kb_i < kb; ++kb_i) {
-      const float* tile = packedWt + base_nb + (size_t)kb_i * 256;
-      // Accumulate over 16 depth positions
-      // acc += tile[kk*16 : kk*16+16) * x[kb_i*16 + kk]
-      const float* xk = x + kb_i * 16;
+// 1 row × 16 cols × K16 (fallback / tails of M4)
+static inline void gemm_row1_packed_16x16(const float *x, const float *packedWt,
+                                          const float *bias, int K, int N,
+                                          float *y) {
+    const int nb = N / 16, kb = K / 16;
+    for (int nb_i = 0; nb_i < nb; ++nb_i) {
+        __m512 acc = _mm512_loadu_ps(bias + nb_i * 16);
+        const size_t base_nb = (size_t)nb_i * kb * 256;
+        for (int kb_i = 0; kb_i < kb; ++kb_i) {
+            const float *tile = packedWt + base_nb + (size_t)kb_i * 256;
+            const float *xk = x + kb_i * 16;
 #pragma unroll(16)
-      for (int kk = 0; kk < 16; ++kk) {
-        __m512 wv = _mm512_loadu_ps(tile + kk * 16);
-        acc = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk[kk]), acc);
-      }
+            for (int kk = 0; kk < 16; ++kk) {
+                __m512 wv = _mm512_loadu_ps(tile + kk * 16);
+                acc = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk[kk]), acc);
+            }
+        }
+        _mm512_storeu_ps(y + nb_i * 16, acc);
     }
-    _mm512_storeu_ps(y + nb_i * 16, acc);
-  }
 }
 
-// Microkernel: compute one row y[0..N) for a given x[0..K) against packed Wt.
-// Bias is added at the end.
-// N is handled in 16-col tiles; K in 16-depth tiles.
-static inline void gemm_row_packed_wt(const float* x, const float* packedWt, const float* bias,
-                                      int K, int N, float* y) {
-  const int Np = (N + N16 - 1) / N16 * N16;
-  const int Kp = (K + K16 - 1) / K16 * K16;
+// 4 rows × 16 cols × K16 (preferred)
+static inline void gemm_row4_packed_16x16(const float *x0, const float *x1,
+                                          const float *x2, const float *x3,
+                                          const float *packedWt,
+                                          const float *bias, int K, int N,
+                                          float *y0, float *y1, float *y2,
+                                          float *y3) {
+    const int nb = N / 16, kb = K / 16;
+    for (int nb_i = 0; nb_i < nb; ++nb_i) {
+        __m512 acc0 = _mm512_loadu_ps(bias + nb_i * 16);
+        __m512 acc1 = acc0;
+        __m512 acc2 = acc0;
+        __m512 acc3 = acc0;
 
-  int n0 = 0;
-  for (; n0 + N16 <= N; n0 += N16) {
-    __m512 acc = _mm512_setzero_ps(); // 16 outputs in lanes
-
-    for (int k0 = 0; k0 < K; k0 += K16) {
-      const float* xk = x + k0;
-      const float* wblk = packedWt + (size_t)n0 * Kp + (size_t)k0 * Np;
-      // accumulate over kk in [0..K16)
-      // For each kk: acc += w[kk, 0..15] * x[k0+kk]
-      // w[kk, 0..15] is contiguous in packed layout.
-      for (int kk = 0; kk < K16; ++kk) {
-        float xv = (k0 + kk < K) ? xk[kk] : 0.0f;
-        __m512 wv = _mm512_loadu_ps(wblk + (size_t)kk * Np);
-        acc = _mm512_fmadd_ps(wv, _mm512_set1_ps(xv), acc);
-      }
+        const size_t base_nb = (size_t)nb_i * kb * 256;
+        for (int kb_i = 0; kb_i < kb; ++kb_i) {
+            const float *tile = packedWt + base_nb + (size_t)kb_i * 256;
+            const float *xk0 = x0 + kb_i * 16;
+            const float *xk1 = x1 + kb_i * 16;
+            const float *xk2 = x2 + kb_i * 16;
+            const float *xk3 = x3 + kb_i * 16;
+#pragma unroll(16)
+            for (int kk = 0; kk < 16; ++kk) {
+                __m512 wv = _mm512_loadu_ps(tile + kk * 16);
+                acc0 = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk0[kk]), acc0);
+                acc1 = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk1[kk]), acc1);
+                acc2 = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk2[kk]), acc2);
+                acc3 = _mm512_fmadd_ps(wv, _mm512_set1_ps(xk3[kk]), acc3);
+            }
+        }
+        _mm512_storeu_ps(y0 + nb_i * 16, acc0);
+        _mm512_storeu_ps(y1 + nb_i * 16, acc1);
+        _mm512_storeu_ps(y2 + nb_i * 16, acc2);
+        _mm512_storeu_ps(y3 + nb_i * 16, acc3);
     }
-    // add bias and store
-    __m512 bv = _mm512_loadu_ps(bias + n0);
-    acc = _mm512_add_ps(acc, bv);
-    _mm512_storeu_ps(y + n0, acc);
-  }
-
-  // ragged right
-  if (n0 < N) {
-    __m512 acc = _mm512_setzero_ps();
-    const __mmask16 mask = (__mmask16)((1u << (N - n0)) - 1);
-    for (int k0 = 0; k0 < K; k0 += K16) {
-      const float* xk = x + k0;
-      const float* wblk = packedWt + (size_t)n0 * ((K + K16 - 1) / K16 * K16) + (size_t)k0 * ((N + N16 - 1)/N16 * N16);
-      for (int kk = 0; kk < K16; ++kk) {
-        float xv = (k0 + kk < K) ? xk[kk] : 0.0f;
-        __m512 wv = _mm512_maskz_loadu_ps(mask, wblk + (size_t)kk * ((N + N16 - 1)/N16 * N16));
-        acc = _mm512_fmadd_ps(wv, _mm512_set1_ps(xv), acc);
-      }
-    }
-    __m512 bv = _mm512_maskz_loadu_ps(mask, bias + n0);
-    acc = _mm512_add_ps(acc, bv);
-    _mm512_mask_storeu_ps(y + n0, mask, acc);
-  }
 }
 
-//=============================
-// Main kernel (single-thread)
-//=============================
-void mha_block_dense(const float* x,   int T, int D,
-                     const float* W_in, const float* b_in,   // [3D, D], [3D]
-                     const float* W_out, const float* b_out, // [D, D],  [D]
-                     int H,
-                     bool causal,
-                     float* y_out)
-{
-  const int Dh = D / H;
-  const float scale = 1.0f / std::sqrt((float)Dh);
+// --------- Main kernel ----------
+void mha_block_dense(const float *x, int T, int D, const float *W_in,
+                     const float *b_in,                      // [3D, D], [3D]
+                     const float *W_out, const float *b_out, // [D, D],  [D]
+                     int H, bool causal, float *y_out) {
+    if ((D % 16) || ((3 * D) % 16))
+        throw std::runtime_error("D and 3D must be multiples of 16");
+    if ((D % H) != 0)
+        throw std::runtime_error("D must be divisible by H");
 
-  // ---- Scratch (persistent across calls would be even better) ----
-  static thread_local int S_T=-1, S_D=-1, S_H=-1;
-  static thread_local std::vector<float> Q;           // [T,D]
-  static thread_local std::vector<float> K;           // [T,D]
-  static thread_local std::vector<float> V;           // [T,D]
-  static thread_local std::vector<float> Qh;          // [H,T,Dh]
-  static thread_local std::vector<float> KhT;         // [H,Dh,T]  (transposed keys per head)
-  static thread_local std::vector<float> Vh;          // [H,T,Dh]
-  static thread_local std::vector<float> Ctx;         // [T,D]
-  static thread_local std::vector<float> Win_packed;  // packed (Wt) for 3*D outputs
-  static thread_local std::vector<float> Wout_packed; // packed (Wt) for D outputs
-  static thread_local int packed_dims = -1;
-  static thread_local std::vector<float> row3D_scratch;
+    const int Dh = D / H;
+    if (Dh != 16)
+        throw std::runtime_error("This optimized path expects Dh=16 (D/H==16)");
+    const __m512 vscale = _mm512_set1_ps(1.0f / std::sqrt(16.0f));
+    const int BK = 128; // key block size
 
-  auto ensure = [&](int t, int d, int h) {
-    if (S_T==t && S_D==d && S_H==h) return;
-    S_T=t; S_D=d; S_H=h;
-    Q.assign((size_t)T*(size_t)D, 0.f);
-    K.assign((size_t)T*(size_t)D, 0.f);
-    V.assign((size_t)T*(size_t)D, 0.f);
-    Qh.assign((size_t)H*(size_t)T*(size_t)Dh, 0.f);
-    KhT.assign((size_t)H*(size_t)Dh*(size_t)T, 0.f);
-    Vh.assign((size_t)H*(size_t)T*(size_t)Dh, 0.f);
-    Ctx.assign((size_t)T*(size_t)D, 0.f);
-    packed_dims = -1; // force repack
-    if ((int)row3D_scratch.size() != 3 * D) row3D_scratch.assign(3 * D, 0.0f);
-  };
-  ensure(T,D,H);
+    // Thread-local scratch
+    static thread_local int S_T = -1, S_D = -1, S_H = -1;
+    static thread_local std::vector<float> Qh;          // [H,T,Dh]
+    static thread_local std::vector<float> KhT;         // [H,Dh,T]
+    static thread_local std::vector<float> Vh;          // [H,T,Dh]
+    static thread_local std::vector<float> Ctx;         // [T,D]
+    static thread_local std::vector<float> Win_packed;  // packed W_in^T: [D,3D]
+    static thread_local std::vector<float> Wout_packed; // packed W_out^T: [D,D]
+    static thread_local std::vector<float> row3D_4;     // [4, 3D]
+    static thread_local int packed_dims = -1;
 
-  // ---- 1) Fused input projection via GEMM: [T,D] x [D,3D] -> [T,3D] ----
-  // W_in is [3D,D] row-major; we need Wt = [D,3D]
-  // We'll pack Wt for our microkernel (N=3D).
-  if (packed_dims != D*3) {
-    // Build Wt temporarily (or pack from W_in directly). Simpler: build Wt then pack.
-    std::vector<float> Wt((size_t)D * (size_t)(3 * D));
-    for (int r = 0; r < D; ++r)
-    for (int c = 0; c < 3 * D; ++c)
-        Wt[(size_t)r * (3 * D) + c] = W_in[(size_t)c * D + r];
-    pack_wt_16x16(Wt.data(), D, 3 * D, Win_packed);
+    auto ensure = [&](int t, int d, int h) {
+        if (S_T == t && S_D == d && S_H == h)
+            return;
+        S_T = t;
+        S_D = d;
+        S_H = h;
+        Qh.assign((size_t)H * (size_t)T * (size_t)Dh, 0.0f);
+        KhT.assign((size_t)H * (size_t)Dh * (size_t)T, 0.0f);
+        Vh.assign((size_t)H * (size_t)T * (size_t)Dh, 0.0f);
+        Ctx.assign((size_t)T * (size_t)D, 0.0f);
+        row3D_4.assign((size_t)4 * (size_t)(3 * D), 0.0f);
+        packed_dims = -1;
+    };
+    ensure(T, D, H);
 
-    // Build WoutT = transpose(W_out: [D,D]) -> [D,D]
-    std::vector<float> WoutT((size_t)D * (size_t)D);
-    for (int r = 0; r < D; ++r)
-    for (int c = 0; c < D; ++c)
-        WoutT[(size_t)r * D + c] = W_out[(size_t)c * D + r];
-    pack_wt_16x16(WoutT.data(), D, D, Wout_packed);
-    packed_dims = D*3;
-  }
+    // --- Pack W_in^T and W_out^T (once per shape) ---
+    if (packed_dims != D * 3) {
+        // W_in: [3D,D] -> Wt_in: [D,3D]
+        std::vector<float> Wt_in((size_t)D * (size_t)(3 * D));
+        for (int r = 0; r < D; ++r)
+            for (int c = 0; c < 3 * D; ++c)
+                Wt_in[(size_t)r * (3 * D) + c] = W_in[(size_t)c * D + r];
+        pack_wt_16x16(Wt_in.data(), D, 3 * D, Win_packed);
 
-  // Run GEMM row-by-row (single thread), then slice into Q/K/V and add bias.
-  for (int t = 0; t < T; ++t) {
-    const float* xt = x + (size_t)t*D;
-    // temp buffer for [3D]
-    float* row3D = row3D_scratch.data();
-    gemm_row_packed_16x16(xt, Win_packed.data(), b_in, D, 3 * D, row3D);
-    // slice into Q,K,V
-    std::memcpy(Q.data() + (size_t)t*D,          row3D + 0*D, D*sizeof(float));
-    std::memcpy(K.data() + (size_t)t*D,          row3D + 1*D, D*sizeof(float));
-    std::memcpy(V.data() + (size_t)t*D,          row3D + 2*D, D*sizeof(float));
-  }
+        // W_out: [D,D] -> Wt_out: [D,D]
+        std::vector<float> Wt_out((size_t)D * (size_t)D);
+        for (int r = 0; r < D; ++r)
+            for (int c = 0; c < D; ++c)
+                Wt_out[(size_t)r * D + c] = W_out[(size_t)c * D + r];
+        pack_wt_16x16(Wt_out.data(), D, D, Wout_packed);
 
-  // ---- 2) Repack by head for tight inner loops ----
-  // Qh[h,t,d] = Q[t, h*Dh + d]
-  // KhT[h,d,t] = K[t, h*Dh + d]
-  // Vh[h,t,d] = V[t, h*Dh + d]
-  for (int h = 0; h < H; ++h) {
-    for (int t = 0; t < T; ++t) {
-      const float* qrow = Q.data() + (size_t)t*D + h*Dh;
-      const float* krow = K.data() + (size_t)t*D + h*Dh;
-      const float* vrow = V.data() + (size_t)t*D + h*Dh;
-      float* qdst = Qh.data() + ((size_t)h*T + t)*Dh;
-      float* vdst = Vh.data() + ((size_t)h*T + t)*Dh;
-      std::memcpy(qdst, qrow, Dh*sizeof(float));
-      std::memcpy(vdst, vrow, Dh*sizeof(float));
-      for (int d0 = 0; d0 < Dh; ++d0) {
-        KhT.data()[((size_t)h*Dh + d0)*T + t] = krow[d0];
-      }
+        packed_dims = D * 3;
     }
-  }
 
-  // ---- 3) Attention per (t,h) with online softmax over key blocks ----
-  // Block size in keys = 64 (4 * 16-lane vectors)
-  static constexpr int BK = 64;
-  const __m512 vscale = _mm512_set1_ps(scale);
+    // --- 1) Q/K/V via GEMM (M=4 microkernel) + direct scatter to head layouts
+    // ---
+    for (int t0 = 0; t0 < T; t0 += 4) {
+        const int R = std::min(4, T - t0);
+        float *y0 = row3D_4.data() + 0 * (3 * D);
+        float *y1 = row3D_4.data() + 1 * (3 * D);
+        float *y2 = row3D_4.data() + 2 * (3 * D);
+        float *y3 = row3D_4.data() + 3 * (3 * D);
 
-  for (int t = 0; t < T; ++t) {
-    float* ctx_t = Ctx.data() + (size_t)t*D; // output of attention before out-proj
-    std::fill(ctx_t, ctx_t + D, 0.f);
+        const float *x0 = x + (size_t)(t0 + 0) * D;
+        const float *x1 = (R > 1) ? x + (size_t)(t0 + 1) * D : x0;
+        const float *x2 = (R > 2) ? x + (size_t)(t0 + 2) * D : x0;
+        const float *x3 = (R > 3) ? x + (size_t)(t0 + 3) * D : x0;
 
-    const int valid_len = causal ? (t + 1) : T;
-
-    for (int h = 0; h < H; ++h) {
-      const float* q = Qh.data() + ((size_t)h*T + t)*Dh;
-      // Running stats
-      float m = -std::numeric_limits<float>::infinity();
-      float l = 0.0f;
-
-      // Accumulator for context (Dh)
-      const int segs = (Dh + 15) / 16;
-      // Keep as registers per segment
-      std::vector<__m512> acc(segs, _mm512_setzero_ps());
-
-      for (int j0 = 0; j0 < valid_len; j0 += BK) {
-        const int take = std::min(BK, valid_len - j0);
-        // Compute logits for this block into four 16-lane vectors s0..s3
-        __m512 s0 = _mm512_setzero_ps();
-        __m512 s1 = _mm512_setzero_ps();
-        __m512 s2 = _mm512_setzero_ps();
-        __m512 s3 = _mm512_setzero_ps();
-
-        for (int d0 = 0; d0 < Dh; ++d0) {
-          const float qd = q[d0];
-          const float* kt_base = KhT.data() + ((size_t)h*Dh + d0)*T + j0;
-          __m512 kd0 = _mm512_maskz_loadu_ps((__mmask16)((take>=16)?0xFFFFu:((1u<<take)-1)), kt_base + 0);
-          s0 = _mm512_fmadd_ps(kd0, _mm512_set1_ps(qd), s0);
-          if (take > 16) {
-            __m512 kd1 = _mm512_maskz_loadu_ps((__mmask16)((take>=32)?0xFFFFu:((1u<<(take-16))-1)), kt_base + 16);
-            s1 = _mm512_fmadd_ps(kd1, _mm512_set1_ps(qd), s1);
-          }
-          if (take > 32) {
-            __m512 kd2 = _mm512_maskz_loadu_ps((__mmask16)((take>=48)?0xFFFFu:((1u<<(take-32))-1)), kt_base + 32);
-            s2 = _mm512_fmadd_ps(kd2, _mm512_set1_ps(qd), s2);
-          }
-          if (take > 48) {
-            __m512 kd3 = _mm512_maskz_loadu_ps((__mmask16)((take>=64)?0xFFFFu:((1u<<(take-48))-1)), kt_base + 48);
-            s3 = _mm512_fmadd_ps(kd3, _mm512_set1_ps(qd), s3);
-          }
+        if (R == 4) {
+            gemm_row4_packed_16x16(x0, x1, x2, x3, Win_packed.data(), b_in, D,
+                                   3 * D, y0, y1, y2, y3);
+        } else {
+            // tails
+            gemm_row1_packed_16x16(x0, Win_packed.data(), b_in, D, 3 * D, y0);
+            if (R > 1)
+                gemm_row1_packed_16x16(x1, Win_packed.data(), b_in, D, 3 * D,
+                                       y1);
+            if (R > 2)
+                gemm_row1_packed_16x16(x2, Win_packed.data(), b_in, D, 3 * D,
+                                       y2);
+            if (R > 3)
+                gemm_row1_packed_16x16(x3, Win_packed.data(), b_in, D, 3 * D,
+                                       y3);
         }
 
-        // scale
-        s0 = _mm512_mul_ps(s0, vscale);
-        if (take > 16) s1 = _mm512_mul_ps(s1, vscale);
-        if (take > 32) s2 = _mm512_mul_ps(s2, vscale);
-        if (take > 48) s3 = _mm512_mul_ps(s3, vscale);
-
-        // Online softmax update for (m, l) and acc
-        float block_max = hmax_ps(_mm512_maskz_mov_ps((__mmask16)((take>=16)?0xFFFFu:((1u<<take)-1)), s0));
-        if (take > 16) block_max = std::max(block_max, hmax_ps(_mm512_maskz_mov_ps((__mmask16)((take>=32)?0xFFFFu:((1u<<(take-16))-1)), s1)));
-        if (take > 32) block_max = std::max(block_max, hmax_ps(_mm512_maskz_mov_ps((__mmask16)((take>=48)?0xFFFFu:((1u<<(take-32))-1)), s2)));
-        if (take > 48) block_max = std::max(block_max, hmax_ps(_mm512_maskz_mov_ps((__mmask16)((take>=64)?0xFFFFu:((1u<<(take-48))-1)), s3)));
-
-        const float m_new = std::max(m, block_max);
-        const float alpha = std::exp(m - m_new);   // scale for previous terms
-
-        // weights in this block
-        __m512 w0 = exp512_ps(_mm512_sub_ps(s0, _mm512_set1_ps(m_new)));
-        __m512 w1 = (take > 16) ? exp512_ps(_mm512_sub_ps(s1, _mm512_set1_ps(m_new))) : _mm512_setzero_ps();
-        __m512 w2 = (take > 32) ? exp512_ps(_mm512_sub_ps(s2, _mm512_set1_ps(m_new))) : _mm512_setzero_ps();
-        __m512 w3 = (take > 48) ? exp512_ps(_mm512_sub_ps(s3, _mm512_set1_ps(m_new))) : _mm512_setzero_ps();
-
-        float l_blk = hsum_ps(_mm512_maskz_mov_ps((__mmask16)((take>=16)?0xFFFFu:((1u<<take)-1)), w0));
-        if (take > 16) l_blk += hsum_ps(_mm512_maskz_mov_ps((__mmask16)((take>=32)?0xFFFFu:((1u<<(take-16))-1)), w1));
-        if (take > 32) l_blk += hsum_ps(_mm512_maskz_mov_ps((__mmask16)((take>=48)?0xFFFFu:((1u<<(take-32))-1)), w2));
-        if (take > 48) l_blk += hsum_ps(_mm512_maskz_mov_ps((__mmask16)((take>=64)?0xFFFFu:((1u<<(take-48))-1)), w3));
-
-        // Update acc: acc = acc * alpha + sum_j w_j * V[j]
-        for (int s = 0; s < segs; ++s) {
-          const int d0 = s * 16;
-          const int chunk = std::min(16, Dh - d0);
-          __m512 accs = acc[s];
-          accs = _mm512_mul_ps(accs, _mm512_set1_ps(alpha));
-
-          auto load_v = [&](int off, __m512 w, __mmask16 mask) {
-            for (int jj = 0; jj < off; jj += 16) {
-              // no-op; structured to keep pattern similar
+        // Scatter each produced row directly into Qh/KhT/Vh (Dh=16, H=D/16)
+        auto scatter_row = [&](int t_idx, const float *row) {
+            const float *qrow = row + 0 * D;
+            const float *krow = row + 1 * D;
+            const float *vrow = row + 2 * D;
+            for (int h = 0; h < H; ++h) {
+                // Qh[h,t,:]
+                std::memcpy(Qh.data() + ((size_t)h * T + t_idx) * Dh,
+                            qrow + h * Dh, Dh * sizeof(float));
+                // Vh[h,t,:]
+                std::memcpy(Vh.data() + ((size_t)h * T + t_idx) * Dh,
+                            vrow + h * Dh, Dh * sizeof(float));
+                // KhT[h,:,t]
+                const float *ks = krow + h * Dh;
+                float *kdst = KhT.data() + ((size_t)h * Dh + 0) * T + t_idx;
+#pragma unroll(16)
+                for (int d0 = 0; d0 < Dh; ++d0) {
+                    kdst[d0 * (size_t)T] = ks[d0];
+                }
             }
-            // Iterate keys in this 16-lane group
-            const int base = off;
-            // Accumulate: accs += sum_l w[l] * V[j0 + base + l, d0:d0+chunk]
-            // We can’t multiply vector w by vector v directly; we broadcast each lane of w.
-            // But that would be 16 FMAs; good locality though.
-            alignas(64) float wtmp[16];
-            _mm512_store_ps(wtmp, w);
+        };
 
-            for (int l16 = 0; l16 < 16 && base + l16 < take; ++l16) {
-              const float wl = wtmp[l16];
-              const float* vrow = Vh.data() + ((size_t)h*T + (j0 + base + l16))*Dh + d0;
-              __m512 vv = _mm512_maskz_loadu_ps((__mmask16)((chunk>=16)?0xFFFFu:((1u<<chunk)-1)), vrow);
-              accs = _mm512_fmadd_ps(vv, _mm512_set1_ps(wl), accs);
+        scatter_row(t0 + 0, y0);
+        if (R > 1)
+            scatter_row(t0 + 1, y1);
+        if (R > 2)
+            scatter_row(t0 + 2, y2);
+        if (R > 3)
+            scatter_row(t0 + 3, y3);
+    }
+
+    // --- 2) Attention (Dh=16 specialized), online softmax, per (t,h) ---
+    for (int t = 0; t < T; ++t) {
+        float *ctx_t =
+            Ctx.data() +
+            (size_t)t * D; // we will overwrite all D entries; no need to clear
+        const int valid_len = causal ? (t + 1) : T;
+
+        for (int h = 0; h < H; ++h) {
+            const float *q = Qh.data() + ((size_t)h * T + t) * Dh; // 16
+            __m512 qv = _mm512_loadu_ps(q);
+
+            float m = -std::numeric_limits<float>::infinity();
+            float l = 0.0f;
+            __m512 acc = _mm512_setzero_ps(); // Dh=16 accumulator
+
+            for (int j0 = 0; j0 < valid_len; j0 += BK) {
+                    const int take = std::min(BK, valid_len - j0);
+
+                    // 1) Accumulate logits for the whole block into s[0..7]
+                    // (each __m512 = 16 keys)
+                    __m512 s[8];
+                    s[0] = s[1] = s[2] = s[3] = s[4] = s[5] = s[6] = s[7] =
+                        _mm512_setzero_ps();
+
+                    // masks for ragged tail
+                    const int c0 = std::min(16, take - 0);
+                    const __mmask16 m0 =
+                        (__mmask16)((c0 > 0) ? ((1u << c0) - 1) : 0);
+                    const int c1 = std::min(16, take - 16);
+                    const __mmask16 m1 =
+                        (__mmask16)((c1 > 0) ? ((1u << c1) - 1) : 0);
+                    const int c2 = std::min(16, take - 32);
+                    const __mmask16 m2 =
+                        (__mmask16)((c2 > 0) ? ((1u << c2) - 1) : 0);
+                    const int c3 = std::min(16, take - 48);
+                    const __mmask16 m3 =
+                        (__mmask16)((c3 > 0) ? ((1u << c3) - 1) : 0);
+                    const int c4 = std::min(16, take - 64);
+                    const __mmask16 m4 =
+                        (__mmask16)((c4 > 0) ? ((1u << c4) - 1) : 0);
+                    const int c5 = std::min(16, take - 80);
+                    const __mmask16 m5 =
+                        (__mmask16)((c5 > 0) ? ((1u << c5) - 1) : 0);
+                    const int c6 = std::min(16, take - 96);
+                    const __mmask16 m6 =
+                        (__mmask16)((c6 > 0) ? ((1u << c6) - 1) : 0);
+                    const int c7 = std::min(16, take - 112);
+                    const __mmask16 m7 =
+                        (__mmask16)((c7 > 0) ? ((1u << c7) - 1) : 0);
+
+#pragma unroll(16)
+                    for (int d0 = 0; d0 < 16; ++d0) {
+                        const float qd = q[d0];
+                        const float *kt =
+                            KhT.data() + ((size_t)h * Dh + d0) * T + j0;
+                        if (m0) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m0, kt + 0);
+                            s[0] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[0]);
+                        }
+                        if (m1) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m1, kt + 16);
+                            s[1] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[1]);
+                        }
+                        if (m2) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m2, kt + 32);
+                            s[2] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[2]);
+                        }
+                        if (m3) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m3, kt + 48);
+                            s[3] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[3]);
+                        }
+                        if (m4) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m4, kt + 64);
+                            s[4] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[4]);
+                        }
+                        if (m5) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m5, kt + 80);
+                            s[5] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[5]);
+                        }
+                        if (m6) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m6, kt + 96);
+                            s[6] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[6]);
+                        }
+                        if (m7) {
+                            __m512 kd = _mm512_maskz_loadu_ps(m7, kt + 112);
+                            s[7] =
+                                _mm512_fmadd_ps(kd, _mm512_set1_ps(qd), s[7]);
+                        }
+                    }
+
+                    // scale all present groups
+                    if (m0)
+                        s[0] = _mm512_mul_ps(s[0], vscale);
+                    if (m1)
+                        s[1] = _mm512_mul_ps(s[1], vscale);
+                    if (m2)
+                        s[2] = _mm512_mul_ps(s[2], vscale);
+                    if (m3)
+                        s[3] = _mm512_mul_ps(s[3], vscale);
+                    if (m4)
+                        s[4] = _mm512_mul_ps(s[4], vscale);
+                    if (m5)
+                        s[5] = _mm512_mul_ps(s[5], vscale);
+                    if (m6)
+                        s[6] = _mm512_mul_ps(s[6], vscale);
+                    if (m7)
+                        s[7] = _mm512_mul_ps(s[7], vscale);
+
+                    // 2) One block max across all present lanes
+                    float block_max = -std::numeric_limits<float>::infinity();
+                    if (m0)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m0, s[0])));
+                    if (m1)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m1, s[1])));
+                    if (m2)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m2, s[2])));
+                    if (m3)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m3, s[3])));
+                    if (m4)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m4, s[4])));
+                    if (m5)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m5, s[5])));
+                    if (m6)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m6, s[6])));
+                    if (m7)
+                        block_max = std::max(
+                            block_max, hmax_ps(_mm512_maskz_mov_ps(m7, s[7])));
+
+                    const float m_new = std::max(m, block_max);
+                    const float alpha = std::exp(m - m_new);
+
+                    // 3) Weights vs m_new for all lanes; accumulate denom and
+                    // context
+                    __m512 w[8];
+                    float l_blk = 0.0f;
+                    if (m0) {
+                        w[0] = exp512_ps(
+                            _mm512_sub_ps(s[0], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m0, w[0]));
+                    }
+                    if (m1) {
+                        w[1] = exp512_ps(
+                            _mm512_sub_ps(s[1], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m1, w[1]));
+                    }
+                    if (m2) {
+                        w[2] = exp512_ps(
+                            _mm512_sub_ps(s[2], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m2, w[2]));
+                    }
+                    if (m3) {
+                        w[3] = exp512_ps(
+                            _mm512_sub_ps(s[3], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m3, w[3]));
+                    }
+                    if (m4) {
+                        w[4] = exp512_ps(
+                            _mm512_sub_ps(s[4], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m4, w[4]));
+                    }
+                    if (m5) {
+                        w[5] = exp512_ps(
+                            _mm512_sub_ps(s[5], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m5, w[5]));
+                    }
+                    if (m6) {
+                        w[6] = exp512_ps(
+                            _mm512_sub_ps(s[6], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m6, w[6]));
+                    }
+                    if (m7) {
+                        w[7] = exp512_ps(
+                            _mm512_sub_ps(s[7], _mm512_set1_ps(m_new)));
+                        l_blk += hsum_ps(_mm512_maskz_mov_ps(m7, w[7]));
+                    }
+
+                    // scale previous accumulators
+                    acc = _mm512_mul_ps(acc, _mm512_set1_ps(alpha));
+
+                    // accumulate V with the new weights
+                    alignas(64) float wb[8][16];
+                    if (m0)
+                        _mm512_store_ps(wb[0], w[0]);
+                    if (m1)
+                        _mm512_store_ps(wb[1], w[1]);
+                    if (m2)
+                        _mm512_store_ps(wb[2], w[2]);
+                    if (m3)
+                        _mm512_store_ps(wb[3], w[3]);
+                    if (m4)
+                        _mm512_store_ps(wb[4], w[4]);
+                    if (m5)
+                        _mm512_store_ps(wb[5], w[5]);
+                    if (m6)
+                        _mm512_store_ps(wb[6], w[6]);
+                    if (m7)
+                        _mm512_store_ps(wb[7], w[7]);
+
+                    auto fma_group = [&](int base, const float *wlane,
+                                         int cnt) {
+                        for (int l = 0; l < cnt; ++l) {
+                            const float *vrow =
+                                Vh.data() +
+                                ((size_t)h * T + (j0 + base + l)) * Dh; // Dh=16
+                            __m512 vv = _mm512_loadu_ps(vrow);
+                            acc = _mm512_fmadd_ps(vv, _mm512_set1_ps(wlane[l]),
+                                                  acc);
+                        }
+                    };
+                    if (c0)
+                        fma_group(0, wb[0], c0);
+                    if (c1)
+                        fma_group(16, wb[1], c1);
+                    if (c2)
+                        fma_group(32, wb[2], c2);
+                    if (c3)
+                        fma_group(48, wb[3], c3);
+                    if (c4)
+                        fma_group(64, wb[4], c4);
+                    if (c5)
+                        fma_group(80, wb[5], c5);
+                    if (c6)
+                        fma_group(96, wb[6], c6);
+                    if (c7)
+                        fma_group(112, wb[7], c7);
+
+                    // update running stats
+                    l = l * alpha + l_blk;
+                    m = m_new;
             }
-          };
 
-          // group 0..15
-          {
-            const __mmask16 m0 = (__mmask16)((take>=16)?0xFFFFu:((1u<<take)-1));
-            load_v(0, w0, m0);
-          }
-          if (take > 16) {
-            const __mmask16 m1 = (__mmask16)((take>=32)?0xFFFFu:((1u<<(take-16))-1));
-            load_v(16, w1, m1);
-          }
-          if (take > 32) {
-            const __mmask16 m2 = (__mmask16)((take>=48)?0xFFFFu:((1u<<(take-32))-1));
-            load_v(32, w2, m2);
-          }
-          if (take > 48) {
-            const __mmask16 m3 = (__mmask16)((take>=64)?0xFFFFu:((1u<<(take-48))-1));
-            load_v(48, w3, m3);
-          }
+            const __m512 inv_l = _mm512_set1_ps(1.0f / l);
+            __m512 outv = _mm512_mul_ps(acc, inv_l);
+            _mm512_storeu_ps(ctx_t + h * Dh, outv); // Dh==16
+        } // heads
+    } // t
 
-          acc[s] = accs;
-        } // segs
+    // --- 3) Output projection via GEMM (M=4 microkernel) ---
+    for (int t0 = 0; t0 < T; t0 += 4) {
+        const int R = std::min(4, T - t0);
+        const float *c0 = Ctx.data() + (size_t)(t0 + 0) * D;
+        const float *c1 = (R > 1) ? Ctx.data() + (size_t)(t0 + 1) * D : c0;
+        const float *c2 = (R > 2) ? Ctx.data() + (size_t)(t0 + 2) * D : c0;
+        const float *c3 = (R > 3) ? Ctx.data() + (size_t)(t0 + 3) * D : c0;
 
-        // update running m, l
-        l = l * alpha + l_blk;
-        m = m_new;
-      } // key blocks
+        float *y0 = y_out + (size_t)(t0 + 0) * D;
+        float *y1 = y_out + (size_t)(t0 + 1) * D;
+        float *y2 = y_out + (size_t)(t0 + 2) * D;
+        float *y3 = y_out + (size_t)(t0 + 3) * D;
 
-      // Normalize and write to ctx_t segment
-      const float inv_l = 1.0f / l;
-      for (int s = 0; s < segs; ++s) {
-        const int d0 = s * 16;
-        const int chunk = std::min(16, Dh - d0);
-        __m512 outv = _mm512_mul_ps(acc[s], _mm512_set1_ps(inv_l));
-        _mm512_mask_storeu_ps(ctx_t + h*Dh + d0,
-                              (__mmask16)((chunk>=16)?0xFFFFu:((1u<<chunk)-1)),
-                              outv);
-      }
-    } // heads
-  } // t
-
-  // ---- 4) Output projection via GEMM: [T,D] x [D,D] -> [T,D] ----
-  for (int t = 0; t < T; ++t) {
-    const float* ct = Ctx.data() + (size_t)t*D;
-    float* yt = y_out + (size_t)t*D;
-    gemm_row_packed_16x16(ct, Wout_packed.data(), b_out, D, D, yt);
-  }
+        if (R == 4) {
+            gemm_row4_packed_16x16(c0, c1, c2, c3, Wout_packed.data(), b_out, D,
+                                   D, y0, y1, y2, y3);
+        } else {
+            gemm_row1_packed_16x16(c0, Wout_packed.data(), b_out, D, D, y0);
+            if (R > 1)
+                gemm_row1_packed_16x16(c1, Wout_packed.data(), b_out, D, D, y1);
+            if (R > 2)
+                gemm_row1_packed_16x16(c2, Wout_packed.data(), b_out, D, D, y2);
+            if (R > 3)
+                gemm_row1_packed_16x16(c3, Wout_packed.data(), b_out, D, D, y3);
+        }
+    }
 }
 
 } // namespace attn
