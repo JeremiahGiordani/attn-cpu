@@ -66,5 +66,5 @@ def run_case(D=128, H=8, T=64, causal=False, seed=0):
     # assert ok
 
 if __name__ == "__main__":
-    run_case(D=128, H=2, T=65, causal=False, seed=42)
-    run_case(D=128, H=2, T=66, causal=True,  seed=123)
+    run_case(D=128, H=8, T=65, causal=False, seed=42)
+    run_case(D=128, H=8, T=66, causal=True,  seed=123)

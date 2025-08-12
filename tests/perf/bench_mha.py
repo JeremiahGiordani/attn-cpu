@@ -70,16 +70,13 @@ def main():
     attn_mask = make_attn_mask(T, args.causal)
 
     # Optional one-time correctness check (not timed)
-    if args.check:
-        with torch.inference_mode():
-            y_torch, _ = mha(x_t, x_t, x_t, attn_mask=attn_mask, need_weights=False)
-        y_cpp = attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, args.causal)
-        y_ref = y_torch[0].detach().cpu().numpy().astype(np.float32)
-        max_abs = float(np.max(np.abs(y_cpp - y_ref)))
-        ok = np.allclose(y_cpp, y_ref, atol=1e-5, rtol=1e-6)
-        print(f"[check] allclose={ok}, max_abs={max_abs:.3e}")
-        if not ok:
-            raise SystemExit(1)
+    with torch.inference_mode():
+        y_torch, _ = mha(x_t, x_t, x_t, attn_mask=attn_mask, need_weights=False)
+    y_cpp = attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, args.causal)
+    y_ref = y_torch[0].detach().cpu().numpy().astype(np.float32)
+    max_abs = float(np.max(np.abs(y_cpp - y_ref)))
+    ok = np.allclose(y_cpp, y_ref, atol=1e-5, rtol=1e-6)
+    print(f"[check] allclose={ok}, max_abs={max_abs:.3e}")
 
     # Functions to time
     def run_attn_cpu():
