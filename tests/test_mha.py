@@ -27,12 +27,12 @@ def run_case(D=128, H=8, T=64, causal=False, seed=0):
     torch.manual_seed(seed)
     mha = nn.MultiheadAttention(embed_dim=D, num_heads=H, batch_first=True, dropout=0.0, bias=True)
 
-    # with torch.no_grad():
-    #     mha.in_proj_bias.zero_()
+    with torch.no_grad():
+        mha.in_proj_bias.zero_()
 
-    # # Zero out the output projection bias
-    # with torch.no_grad():
-    #     mha.out_proj.bias.zero_()
+    # Zero out the output projection bias
+    with torch.no_grad():
+        mha.out_proj.bias.zero_()
     x = torch.randn(1, T, D, dtype=torch.float32)  # [B=1,T,D]
 
     W_in, b_in, W_out, b_out = extract_in_out(mha)

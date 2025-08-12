@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.16)
 project(attn_cpu LANGUAGES CXX)
 
 option(ATTN_BUILD_PYTHON "Build Python extension" ON)
-option(ATTN_USE_OPENMP   "Enable OpenMP (not required for M0)" OFF)
+option(ATTN_USE_OPENMP   "Enable OpenMP (not required for M0)" ON)
 option(ATTN_NATIVE_OPT   "Enable -march=native" ON)
+option(ATTN_USE_AVX512 "Enable AVX-512 kernels" ON)
 
 # Silence pybind11 message; prefer modern FindPython behavior
 set(PYBIND11_FINDPYTHON NEW)
@@ -18,9 +19,16 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if (MSVC)
   add_compile_options(/O2 /fp:fast)
 else()
-  add_compile_options(-O3 -fno-omit-frame-pointer)
+  add_compile_options(-O3 -ffast-math -fno-math-errno -fno-trapping-math -fno-omit-frame-pointer)
   if (ATTN_NATIVE_OPT)
     add_compile_options(-march=native)
+  endif()
+endif()
+
+if (ATTN_USE_AVX512)
+  add_compile_definitions(ATTN_USE_AVX512=1)
+  if (NOT MSVC)
+    add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl)
   endif()
 endif()
 
