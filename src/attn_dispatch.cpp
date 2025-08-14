@@ -96,14 +96,14 @@ void mha_block_dense(const float* x, int T, int D,
 
     // Attention
     if (!causal && Dh == 16) {
-      kernels::run_dh16_m4_nocausal(Qh, KhT, Vh, T, H, Ctx);
+      kernels::run_dh16_m4_nocausal(Qh, KhT, Vh, T, H, D, Dh, Ctx);
     } else if (!causal && (Dh % 16 == 0)) {
       // NEW: fast path for Dh = k*16 (e.g., 32 when H=4 for D=128)
-      kernels::run_dhk16_m4_nocausal(Qh, KhT, Vh, T, H, Dh, Ctx);
+      kernels::run_dhk16_m4_nocausal(Qh, KhT, Vh, T, H, D, Dh, Ctx);
     } else if (Dh == 16) {
-      kernels::run_dh16_m1_online(Qh, KhT, Vh, T, H, causal, Ctx);
+      kernels::run_dh16_m1_online(Qh, KhT, Vh, T, H, D, Dh, causal, Ctx);
     } else {
-      kernels::run_generic_m1_online(Qh, KhT, Vh, T, H, Dh, causal, Ctx);
+      kernels::run_generic_m1_online(Qh, KhT, Vh, T, H, D, Dh, causal, Ctx);
     }
 
     // Output GEMM

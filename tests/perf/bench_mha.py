@@ -52,8 +52,8 @@ def main():
     D, H, T = args.D, args.H, args.T
 
     D = 128
-    H = 8
-    T = 1025
+    H = 4
+    T = 1024
 
     causal = args.causal
     causal = False
