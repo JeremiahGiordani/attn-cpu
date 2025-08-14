@@ -10,10 +10,6 @@
 
 namespace attn {
 
-#if !defined(ATTN_USE_AVX512)
-#error "Compile with ATTN_USE_AVX512 and AVX-512 flags."
-#endif
-
 // --------- AVX-512 helpers ----------
 static inline float hsum_ps(__m512 v) {
     return _mm512_reduce_add_ps(v);

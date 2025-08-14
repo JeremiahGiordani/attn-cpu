@@ -50,6 +50,15 @@ def main():
     args = p.parse_args()
 
     D, H, T = args.D, args.H, args.T
+
+    D = 128
+    H = 8
+    T = 1025
+
+    causal = args.causal
+    causal = False
+
+
     assert D % H == 0, "D must be divisible by H"
 
     if args.threads > 0:
@@ -67,12 +76,12 @@ def main():
     # Precompute everything needed for both paths (avoid conversions in timed loops)
     W_in, b_in, W_out, b_out = extract_in_out(mha)
     x_np = x_t[0].detach().cpu().contiguous().numpy().astype(np.float32)   # [T,D] for our binding
-    attn_mask = make_attn_mask(T, args.causal)
+    attn_mask = make_attn_mask(T, causal)
 
     # Optional one-time correctness check (not timed)
     with torch.inference_mode():
         y_torch, _ = mha(x_t, x_t, x_t, attn_mask=attn_mask, need_weights=False)
-    y_cpp = attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, args.causal)
+    y_cpp = attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, causal)
     y_ref = y_torch[0].detach().cpu().numpy().astype(np.float32)
     max_abs = float(np.max(np.abs(y_cpp - y_ref)))
     ok = np.allclose(y_cpp, y_ref, atol=1e-5, rtol=1e-6)
@@ -80,20 +89,21 @@ def main():
 
     # Functions to time
     def run_attn_cpu():
-        attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, args.causal)
+        attn_cpu.mha_block_dense(x_np, W_in, b_in, W_out, b_out, H, causal)
 
     @torch.inference_mode()
     def run_torch():
         mha(x_t, x_t, x_t, attn_mask=attn_mask, need_weights=False)
 
     # Bench
-    mean_attn_cpu_s, times_attn_cpu = bench(run_attn_cpu, args.warmup, args.iters)
     mean_torch_s,     times_torch   = bench(run_torch,    args.warmup, args.iters)
+
+    mean_attn_cpu_s, times_attn_cpu = bench(run_attn_cpu, args.warmup, args.iters)
 
     # Report
     def ms(x): return x * 1000.0
     print("\n=== Benchmark Results (CPU) ===")
-    print(f"Shape: D={D}, H={H}, T={T}, causal={args.causal}")
+    print(f"Shape: D={D}, H={H}, T={T}, causal={causal}")
     print(f"Threads: torch={torch.get_num_threads()}, OMP={os.environ.get('OMP_NUM_THREADS','')}")
     print(f"Iterations: warmup={args.warmup}, measured={args.iters}")
     print(f"attn_cpu.mha_block_dense : {ms(mean_attn_cpu_s):8.3f} ms/iter  "

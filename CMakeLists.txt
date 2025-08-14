@@ -47,9 +47,7 @@ add_subdirectory(third_party/pybind11)
 
 # ---------- Library target ----------
 add_library(attn STATIC
-  src/attn_dense.cpp
-  src/attn_block.cpp
-  src/attn_mha.cpp 
+  src/attn_dispatch.cpp 
 )
 
 target_include_directories(attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
