@@ -4,8 +4,9 @@
 #include "pack_16x16.h"
 #include "gemm_16x16.h"
 #include "layout.h"
-#include "attn_dh16_m4_nocausal.h"
-#include "attn_dh16_m1_generic.h"
+#include "kernels/attn_dh16_m4_nocausal.h"
+#include "kernels/attn_dh16_m1_generic.h"
+#include "kernels/attn_dhk16_m4_nocausal.h"
 #include "attn_generic_m1.h"
 #include <vector>
 #include <cstring>
@@ -95,11 +96,14 @@ void mha_block_dense(const float* x, int T, int D,
 
     // Attention
     if (!causal && Dh == 16) {
-      kernels::run_dh16_m4_nocausal(Qh, KhT, Vh, T, H, D, Dh, Ctx);
+      kernels::run_dh16_m4_nocausal(Qh, KhT, Vh, T, H, Ctx);
+    } else if (!causal && (Dh % 16 == 0)) {
+      // NEW: fast path for Dh = k*16 (e.g., 32 when H=4 for D=128)
+      kernels::run_dhk16_m4_nocausal(Qh, KhT, Vh, T, H, Dh, Ctx);
     } else if (Dh == 16) {
-      kernels::run_dh16_m1_online(Qh, KhT, Vh, T, H, D, Dh, causal, Ctx);
+      kernels::run_dh16_m1_online(Qh, KhT, Vh, T, H, causal, Ctx);
     } else {
-      kernels::run_generic_m1_online(Qh, KhT, Vh, T, H, D, Dh, causal, Ctx);
+      kernels::run_generic_m1_online(Qh, KhT, Vh, T, H, Dh, causal, Ctx);
     }
 
     // Output GEMM
