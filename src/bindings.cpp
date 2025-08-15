@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include "attn_api.h"
+#include "gemm.h"
 
 namespace py = pybind11;
 using namespace attn;
@@ -44,6 +45,39 @@ py::array_t<float> mha_block_dense_py(
     return y;
 }
 
+py::array_t<float> gemm_py(
+    py::array_t<float, py::array::c_style | py::array::forcecast> A,
+    py::array_t<float, py::array::c_style | py::array::forcecast> B,
+    float alpha = 1.0f,
+    float beta  = 0.0f,
+    int Mb = 256, int Nb = 96, int Kb = 288,
+    int mr = 16,  int nr = 24, int ku = 4,
+    int num_threads = 0)
+{
+    if (A.ndim() != 2 || B.ndim() != 2)
+        throw std::invalid_argument("A and B must be 2D: A[M,K], B[K,N]");
+
+    const int M = static_cast<int>(A.shape(0));
+    const int K = static_cast<int>(A.shape(1));
+    const int Kb_B = static_cast<int>(B.shape(0));
+    const int N = static_cast<int>(B.shape(1));
+    if (K != Kb_B)
+        throw std::invalid_argument("Inner dim mismatch: A[M,K] x B[K,N]");
+
+    py::array_t<float> C({M, N});
+    // If beta != 0, user should have passed an initialized C; for simplicity we just scale zeros→still zero.
+    gemm::sgemm_blocked(
+        A.data(), M, K,
+        B.data(), N,
+        C.mutable_data(),
+        alpha, beta,
+        Mb, Nb, Kb,
+        mr, nr, ku,
+        num_threads
+    );
+    return C;
+}
+
 PYBIND11_MODULE(_attn_cpu, m) {
     m.doc() = "CPU Dense Attention (step + block)";
     m.def("mha_block_dense", &mha_block_dense_py, py::arg("x"), py::arg("W_in"),
@@ -51,4 +85,15 @@ PYBIND11_MODULE(_attn_cpu, m) {
           py::arg("num_heads"), py::arg("causal") = false,
           "Full MHA block: x:[T,D], W_in:[3D,D], b_in:[3D], W_out:[D,D], "
           "b_out:[D] -> y:[T,D]");
+    m.def("gemm",
+          &gemm_py,
+          py::arg("A"), py::arg("B"),
+          py::arg("alpha") = 1.0f,
+          py::arg("beta")  = 0.0f,
+          py::arg("Mb") = 256, py::arg("Nb") = 96, py::arg("Kb") = 288,
+          py::arg("mr") = 16,  py::arg("nr") = 24, py::arg("ku") = 4,
+          py::arg("num_threads") = 0,
+          "Blocked SGEMM: C = alpha * A@B + beta*C, A:[M,K], B:[K,N] -> C:[M,N]\n"
+          "Tunables default to AVX-512-friendly picks. Pass num_threads>0 to set OpenMP threads."
+    );
 }

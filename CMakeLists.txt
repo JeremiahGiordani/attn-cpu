@@ -48,6 +48,7 @@ add_subdirectory(third_party/pybind11)
 # ---------- Library target ----------
 add_library(attn STATIC
   src/attn_dispatch.cpp 
+  src/gemm.cpp 
 )
 
 target_include_directories(attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
