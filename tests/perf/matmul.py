@@ -15,13 +15,12 @@ from attn_cpu import (
 # ----------------------------------------------------------------------
 # Experiment parameters
 # ----------------------------------------------------------------------
-# Resnet toy example dimensions:
-M = 147
-K = 64
-N = 12544
+M = 2048
+K = 1280
+N = 960
 
 # Benchmark dimensions:
-N_RUNS     = 100     # <-- number of repetitions
+N_RUNS     = 20     # <-- number of repetitions
 SEED       = 42
 # ----------------------------------------------------------------------
 
@@ -36,9 +35,10 @@ B  = np.random.randn(K, N).astype(np.float32)
 A_t   = torch.tensor(A)
 B_t    = torch.tensor(B)
 
-# num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
-# torch.set_num_threads(num_threads)
-num_threads = None
+num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+torch.set_num_threads(num_threads)
+torch.set_num_interop_threads(1)
+num_threads = num_threads
 
 
 # ----------------------------------------------------------------------
@@ -63,7 +63,7 @@ def numpy_run():
     return A @ B
 
 def cpu_run():
-    return matmul(A, B)
+    return gemm(A, B)
 
 # ----------------------------------------------------------------------
 # Correctness check (one-shot)
@@ -71,15 +71,15 @@ def cpu_run():
 print("=== Verifying correctness ===")
 out_torch  = torch_run().numpy()
 print("Torch vs NumPy :", np.allclose(out_torch, numpy_run(), atol=1e-4))
-print("Torch vs Bilinear Diagonal:", np.allclose(out_torch, cpu_run(), atol=1e-4))
+print("Torch vs GEMM:", np.allclose(out_torch, cpu_run(), atol=1e-4))
 print()
 
 # ----------------------------------------------------------------------
 # Benchmark
 # ----------------------------------------------------------------------
 print(f"=== Average runtime over {N_RUNS:,} runs ===")
-print(f"=== Sparsity: {SPARSITY:.2f}, M: {M:,}, K: {K:,}, N: {N} ===")
+print(f"=== Sparsity: M: {M:,}, K: {K:,}, N: {N} ===")
 print(f"=== Threads: {num_threads} ===")
 print(f"[PyTorch]      {timed_avg(torch_run)*1000:.3f} ms")
 print(f"[NumPy]        {timed_avg(numpy_run)*1000:.3f} ms")
-print(f"[Bilinear Diagonal] {timed_avg(cpu_run)*1000:.3f} ms")
+print(f"[GEMM]         {timed_avg(cpu_run)*1000:.3f} ms")

@@ -5,12 +5,10 @@
 #include <vector>
 #include <cstring>
 #include <immintrin.h>
+#include <omp.h>
+#include "kernels/microkernel_16x8_avx512.h"
 
-#if defined(_OPENMP)
-  #include <omp.h>
-#endif
-
-// Tunable prefetch distances (in k elements)
+// Prefetch distances (in "k" elements)
 #ifndef GEMM_PREFETCH_DIST_K
 #define GEMM_PREFETCH_DIST_K 64
 #endif
@@ -18,12 +16,17 @@
 #define GEMM_PREFETCH_DIST_BJ 32
 #endif
 
+#ifndef GEMM_NR_MAX
+#define GEMM_NR_MAX 12
+#endif
+
+
 namespace {
 
 // ---------------------------- Packing helpers -----------------------------
 
 // Pack B panel: source B row-major [K x N] (ldB = N).
-// Destination Bp is column-major inside the panel [Kp x Np]:
+// Destination Bp is column-major [Kp x Np]:
 //   Bp[j*Kp + k] = B[(k0 + k), (n0 + j)]
 inline void pack_B_panel_colmajor(const float* B, int ldB,
                                   int k0, int n0,
@@ -59,184 +62,132 @@ inline void pack_A_micropanel_colmajor(const float* A, int ldA,
     }
 }
 
-// Scatter store 16 rows of a C column with stride ldC, optionally masked (mr_eff < 16).
-inline void scatter_store_16_rows(const __m512 v, float* base, int ldC, int mr_eff)
-{
-    // idx[r] = r * ldC (floats). i32scatter uses a byte-scale; we pass scale=4.
-    alignas(64) int idx_arr[16];
-    const int lanes = 16;
-    for (int r = 0; r < lanes; ++r) idx_arr[r] = r * ldC;
-    const __m512i idx = _mm512_load_si512((const void*)idx_arr);
-
-    if (mr_eff >= 16) {
-        _mm512_i32scatter_ps(base, idx, v, /*scale=*/4);
-    } else {
-        const __mmask16 mask = (mr_eff <= 0) ? 0 : (__mmask16)((1u << mr_eff) - 1u);
-        _mm512_mask_i32scatter_ps(base, mask, idx, v, /*scale=*/4);
-    }
-}
-
 // ---------------------------- AVX-512 microkernel -----------------------------
 
-// Rows = lanes (mr=16). Keep up to nr<=24 columns of C live in regs.
-// K-unrolled by `ku` (typ. 4). B is scalar-broadcast per column; A is vector-load per k.
-//
-// Inputs:
-//   Ap:      [Kp x 16], column-major: Ap[k*16 + r]
-//   Bp_tile: [Kp x nr_eff], column-major per output column: Bp_tile[j*Kp + k]
-//   Kp: depth of this K-slab
-//   nr_eff: number of output columns in this micro-tile (<= 24)
-//   ldC: leading dim of row-major C (N)
-//   Cblk: top-left ptr of this C micro-tile (row-major)
-//   alpha: scale factor for A*B
-//   ku: K unroll (1,2,4,...)
-//
-// Notes:
-//  - We rely on Ap being zero-padded when mr_eff < 16, so loads are unmasked.
-//  - We do masked scatter on store if mr_eff < 16.
-//  - Light prefetching for Ap and Bp_tile; no NT/streaming stores (by request).
-inline void kernel_mr16_nrXX_ku_avx512(const float* Ap,
-                                       const float* Bp_tile,
-                                       int Kp, int nr_eff,
-                                       int ldC, float* Cblk,
-                                       float alpha, int ku,
-                                       int mr_eff)
-{
-    // Limit nr_eff to 24 accumulators (fits nicely under 32 zmm with temps).
-    const int NR_MAX = 24;
-    if (nr_eff > NR_MAX) nr_eff = NR_MAX;
+inline __m512i make_row_index_bytes(int ldC) {
+    alignas(64) int idx[16];
+    for (int r = 0; r < 16; ++r) idx[r] = r * ldC * int(sizeof(float));
+    return _mm512_load_si512(idx);
+}
 
-    __m512 Creg[NR_MAX];
-    for (int j = 0; j < nr_eff; ++j) {
-        Creg[j] = _mm512_setzero_ps();
-    }
+// AVX-512 microkernel: mr=16, 1<=nr_eff<=GEMM_NR_MAX, ku in [1..8]
+// Accumulates C += alpha * Ap(16xKp) * Bp_tile(Kp x nr_eff).
+inline void kernel_mr16_nrXX_ku_avx512(
+    const float* __restrict Ap,       // [Kp x 16] packed col-major
+    const float* __restrict Bp_tile,  // [Kp x nr_eff] packed col-major
+    int Kp, int nr_eff,
+    int ldC, float* __restrict Cblk,  // C starting at (m1, n1)
+    float alpha, int ku,
+    int mr_eff
+){
+    if (nr_eff > GEMM_NR_MAX) nr_eff = GEMM_NR_MAX;
+    if (ku < 1) ku = 1; if (ku > 8) ku = 8;
+
+    __m512 Creg[GEMM_NR_MAX];
+    for (int j = 0; j < nr_eff; ++j) Creg[j] = _mm512_setzero_ps();
+
+    const __m512 Alpha = _mm512_set1_ps(alpha);
 
     int k = 0;
-
-    // Unrolled K loop
     for (; k + ku <= Kp; k += ku) {
-        __m512 Avec[8]; // support up to ku=8 (we'll only use [0..ku-1])
+        __m512 Avec[8];
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            if (t < ku) {
-                Avec[t] = _mm512_loadu_ps(&Ap[(k + t) * 16]); // 16 rows at depth k+t
-                // Prefetch A ahead
-                if (k + t + GEMM_PREFETCH_DIST_K < Kp) {
-                    const float* pfA = &Ap[(k + t + GEMM_PREFETCH_DIST_K) * 16];
-                    _mm_prefetch((const char*)(pfA), _MM_HINT_T0);
-                }
+            if (t >= ku) break;
+            // load A(k + t, 16 rows) and scale by alpha once
+            __m512 a = _mm512_loadu_ps(&Ap[(k + t) * 16]);
+            Avec[t]  = _mm512_mul_ps(a, Alpha);
+
+            if (k + t + GEMM_PREFETCH_DIST_K < Kp) {
+                _mm_prefetch((const char*)(&Ap[(k + t + GEMM_PREFETCH_DIST_K) * 16]), _MM_HINT_T0);
             }
         }
 
-        // Process each output column j
+        // FMAs across columns
+        #pragma unroll
         for (int j = 0; j < nr_eff; ++j) {
-            const float* Bj_col = Bp_tile + j * Kp;
-
-            // Prefetch upcoming B scalars along k
+            const float* __restrict Bj_col = Bp_tile + j * Kp;
             if (k + GEMM_PREFETCH_DIST_BJ < Kp) {
                 _mm_prefetch((const char*)(Bj_col + k + GEMM_PREFETCH_DIST_BJ), _MM_HINT_T0);
             }
-
-            // Accumulate ku FMAs for this column
             #pragma unroll
             for (int t = 0; t < 8; ++t) {
-                if (t < ku) {
-                    const float bj = (Bj_col[k + t]) * alpha;   // fold alpha here
-                    const __m512 Bj_bcast = _mm512_set1_ps(bj);
-                    Creg[j] = _mm512_fmadd_ps(Avec[t], Bj_bcast, Creg[j]);
-                }
+                if (t >= ku) break;
+                const __m512 bj = _mm512_set1_ps(Bj_col[k + t]);
+                Creg[j] = _mm512_fmadd_ps(Avec[t], bj, Creg[j]);
             }
         }
     }
 
-    // Tail of K (ku-agnostic)
+    // K tail
     for (; k < Kp; ++k) {
-        const __m512 Avec = _mm512_loadu_ps(&Ap[k * 16]);
+        __m512 Avec = _mm512_loadu_ps(&Ap[k * 16]);
+        Avec = _mm512_mul_ps(Avec, Alpha);
         for (int j = 0; j < nr_eff; ++j) {
-            const float bj = (Bp_tile[j * Kp + k]) * alpha;
-            const __m512 Bj_bcast = _mm512_set1_ps(bj);
-            Creg[j] = _mm512_fmadd_ps(Avec, Bj_bcast, Creg[j]);
+            const __m512 bj = _mm512_set1_ps(Bp_tile[j * Kp + k]);
+            Creg[j] = _mm512_fmadd_ps(Avec, bj, Creg[j]);
         }
     }
 
-    // Store (+=) into C once (one column at a time, rows with stride ldC)
+    // ---- Write-back: dump columns to tiny temp, then contiguous row adds ----
+    alignas(64) float Ct[GEMM_NR_MAX][16];
     for (int j = 0; j < nr_eff; ++j) {
-        // Read current C column values, add Creg, write back. Since we avoided NT stores,
-        // we simply accumulate in memory: C[r*ldC + j] += Creg[j][r].
-        // Using scatter to avoid scalar inner loops.
-        // Load current C column to temp, add, and scatter result.
-        // To minimize loads, we do gather-add-scatter per column.
+        _mm512_storeu_ps(&Ct[j][0], Creg[j]);
+    }
 
-        // Prepare indices once (gather/scatter)
-        alignas(64) int idx_arr[16];
-        for (int r = 0; r < 16; ++r) idx_arr[r] = r * ldC;
-        const __m512i idx = _mm512_load_si512((const void*)idx_arr);
-
-        float* base = Cblk + j;
-
-        // Gather current C
-        __m512 Cold;
-        if (mr_eff >= 16) {
-            Cold = _mm512_i32gather_ps(idx, (const void*)base, /*scale=*/4);
-        } else {
-            const __mmask16 mask = (mr_eff <= 0) ? 0 : (__mmask16)((1u << mr_eff) - 1u);
-            Cold = _mm512_mask_i32gather_ps(_mm512_setzero_ps(), mask, idx, (const void*)base, 4);
+    if (mr_eff >= 16) {
+        for (int r = 0; r < 16; ++r) {
+            float* Crow = Cblk + r * ldC;  // contiguous over N
+            #pragma unroll
+            for (int j = 0; j < nr_eff; ++j) {
+                Crow[j] += Ct[j][r];
+            }
         }
-
-        // Add accumulators
-        const __m512 Cnew = _mm512_add_ps(Cold, Creg[j]);
-
-        // Scatter back
-        scatter_store_16_rows(Cnew, base, ldC, mr_eff);
+    } else {
+        for (int r = 0; r < mr_eff; ++r) {
+            float* Crow = Cblk + r * ldC;
+            #pragma unroll
+            for (int j = 0; j < nr_eff; ++j) {
+                Crow[j] += Ct[j][r];
+            }
+        }
     }
 }
 
-// ---------------------------- Top level (blocked GEMM) -----------------------------
 
 } // anonymous namespace
 
 namespace gemm {
 
-void sgemm_blocked(const float* A, int M, int K,
-                   const float* B, int N,
-                   float* C,
+void sgemm_blocked(const float* __restrict A, int M, int K,
+                   const float* __restrict B, int N,
+                   float* __restrict C,
                    float alpha, float beta,
                    int Mb, int Nb, int Kb,
                    int mr, int nr, int ku)
 {
+    // Fixed kernel shape (we’ll do nr tail for <8)
+    mr = GEMM_MR;            // 16
+    nr = std::min(std::max(1, nr), GEMM_NR); // clamp to 8
+    ku = std::min(std::max(1, ku), GEMM_KU); // clamp to 8
 
-    const char* env = std::getenv("OMP_NUM_THREADS");
-    int nth       = env ? std::atoi(env) : omp_get_max_threads();
-    // We specialize for mr=16, nr<=24. If caller passes something else, clamp/sanitize.
-    if (mr != 16) mr = 16;
-    if (nr > 24)  nr = 24;
-    if (nr < 1)   nr = 1;
-    if (ku < 1)   ku = 1;
-    if (ku > 8)   ku = 8; // our kernel buffers up to 8 A-vectors
+    const int ldA = K, ldB = N, ldC = N;
 
-    const int ldA = K;
-    const int ldB = N;
-    const int ldC = N;
-
-    // beta handling on C
+    // Initialize C (beta)
     if (beta == 0.0f) {
-        std::fill(C, C + static_cast<size_t>(M) * N, 0.0f);
+        std::fill(C, C + (size_t)M * N, 0.0f);
     } else if (beta != 1.0f) {
-        const size_t total = static_cast<size_t>(M) * N;
-        #pragma omp parallel for if(total > (1<<15))
-        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(total); ++i) {
-            C[i] *= beta;
-        }
+        const size_t total = (size_t)M * N;
+        #pragma omp parallel for if (total > (1<<15))
+        for (ptrdiff_t i = 0; i < (ptrdiff_t)total; ++i) C[i] *= beta;
     }
 
-    // Allocate once per call: max B panel (Kb x Nb) and A micro-panel (Kb x mr)
-    std::vector<float> Bp; Bp.resize(static_cast<size_t>(Kb) * Nb);
-    std::vector<float> Ap; Ap.resize(static_cast<size_t>(Kb) * mr);
+    // Tuned block sizes (good starting points on AVX-512):
+    if (Mb <= 0) Mb = 192;                 // rows per macro-tile
+    if (Nb <= 0) Nb = 256;                 // cols per B panel (multiple of 8)
+    if (Kb <= 0) Kb = 384;                 // depth of K slab (fits L2 with A-pack)
 
-    // OpenMP threads
-    #if defined(_OPENMP)
-    if (nth > 0) omp_set_num_threads(nth);
-    #endif
+    std::vector<float> Bp; Bp.resize((size_t)Kb * Nb);
 
     for (int n0 = 0; n0 < N; n0 += Nb) {
         const int Np = std::min(Nb, N - n0);
@@ -244,40 +195,49 @@ void sgemm_blocked(const float* A, int M, int K,
         for (int k0 = 0; k0 < K; k0 += Kb) {
             const int Kp = std::min(Kb, K - k0);
 
-            // Pack B panel once for this (n0,k0)
+            // Pack B panel [Kp x Np]
             pack_B_panel_colmajor(B, ldB, k0, n0, Kp, Np, Bp.data());
 
-            // Sweep M blocks (parallel loop) reusing same packed B panel
-            #if defined(_OPENMP)
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (int m0 = 0; m0 < M; m0 += Mb) {
-                const int Mp = std::min(Mb, M - m0);
+            const bool first_panel = (k0 == 0) && (beta == 0.0f);
+            const bool last_panel  = (k0 + Kp == K);
 
-                for (int m1 = m0; m1 < m0 + Mp; m1 += mr) {
-                    const int mr_eff = std::min(mr, m0 + Mp - m1);
+            #pragma omp parallel
+            {
+                float* Ap_thread = (float*)_mm_malloc(sizeof(float) * (size_t)Kp * mr, 64);
 
-                    // Pack A micro-panel for rows m1.. and K-slab k0..k0+Kp
-                    pack_A_micropanel_colmajor(A, ldA, m1, k0, mr, mr_eff, Kp, Ap.data());
+                #pragma omp for schedule(static)
+                for (int m0 = 0; m0 < M; m0 += Mb) {
+                    const int Mp = std::min(Mb, M - m0);
 
-                    for (int n1 = n0; n1 < n0 + Np; n1 += nr) {
-                        const int nr_eff = std::min(nr, n0 + Np - n1);
+                    for (int m1 = m0; m1 < m0 + Mp; m1 += mr) {
+                        const int mr_eff = std::min(mr, m0 + Mp - m1);
 
-                        float* Cblk = C + static_cast<size_t>(m1) * ldC + n1;
-                        const float* Bp_tile = Bp.data() + (n1 - n0) * Kp;
+                        // Pack A micro-panel once per (m1, k0..k0+Kp)
+                        pack_A_micropanel_colmajor(A, ldA, m1, k0, mr, mr_eff, Kp, Ap_thread);
 
-                        kernel_mr16_nrXX_ku_avx512(
-                            Ap.data(), Bp_tile,
-                            Kp, nr_eff,
-                            ldC, Cblk,
-                            alpha, ku,
-                            mr_eff
-                        );
+                        // Walk columns in n1..n1+8 tiles
+                        for (int n1 = n0; n1 < n0 + Np; n1 += GEMM_NR) {
+                            const int nr_eff = std::min(GEMM_NR, n0 + Np - n1);
+
+                            float* __restrict Cblk = C + (size_t)m1 * ldC + n1;
+                            const float* __restrict Bp_tile = Bp.data() + (size_t)(n1 - n0) * Kp;
+
+                            kernel_16x8_f32_avx512(
+                                Ap_thread, Bp_tile,
+                                Kp, nr_eff,
+                                ldC, Cblk,
+                                alpha,
+                                first_panel,
+                                last_panel,
+                                mr_eff
+                            );
+                        }
                     }
                 }
-            } // m0
+
+                _mm_free(Ap_thread);
+            } // parallel
         } // k0
     } // n0
 }
-
-} // namespace gemm
+}
