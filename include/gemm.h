@@ -12,7 +12,6 @@ void sgemm_blocked(const float* A, int M, int K,
                    float* C,
                    float alpha = 1.0f, float beta = 0.0f,
                    int Mb = 256, int Nb = 96, int Kb = 288,
-                   int mr = 16, int nr = 24, int ku = 4,
-                   int num_threads = 0);
+                   int mr = 16, int nr = 24, int ku = 4);
 
 } // namespace gemm
