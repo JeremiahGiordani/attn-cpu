@@ -62,6 +62,27 @@ inline void pack_A_micropanel_colmajor(const float* A, int ldA,
     }
 }
 
+
+inline void pack_A_micropanel_colmajor_alpha(const float* A, int ldA,
+                                             int m1, int k0,
+                                             int mr, int mr_eff, int Kp,
+                                             float alpha,
+                                             float* Ap)
+{
+    const bool scale = (alpha != 1.0f);
+    for (int k = 0; k < Kp; ++k) {
+        const float* a_base = A + (m1 * ldA + (k0 + k));
+        int r = 0;
+        if (scale) {
+            for (; r < mr_eff; ++r) Ap[k*mr + r] = a_base[r * ldA] * alpha;
+        } else {
+            for (; r < mr_eff; ++r) Ap[k*mr + r] = a_base[r * ldA];
+        }
+        for (; r < mr; ++r) Ap[k*mr + r] = 0.0f;
+    }
+}
+
+
 // ---------------------------- AVX-512 microkernel -----------------------------
 
 inline __m512i make_row_index_bytes(int ldC) {
@@ -156,7 +177,6 @@ inline void kernel_mr16_nrXX_ku_avx512(
 
 
 } // anonymous namespace
-
 namespace gemm {
 
 void sgemm_blocked(const float* __restrict A, int M, int K,
@@ -166,14 +186,14 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
                    int Mb, int Nb, int Kb,
                    int mr, int nr, int ku)
 {
-    // Fixed kernel shape (we’ll do nr tail for <8)
-    mr = GEMM_MR;            // 16
-    nr = std::min(std::max(1, nr), GEMM_NR); // clamp to 8
-    ku = std::min(std::max(1, ku), GEMM_KU); // clamp to 8
+    // Fixed kernel shape
+    mr = GEMM_MR;                    // 16
+    nr = std::clamp(nr, 1, GEMM_NR_FULL); // up to 16
+    ku = std::clamp(ku, 1, GEMM_KU); // up to 8
 
     const int ldA = K, ldB = N, ldC = N;
 
-    // Initialize C (beta)
+    // beta handling
     if (beta == 0.0f) {
         std::fill(C, C + (size_t)M * N, 0.0f);
     } else if (beta != 1.0f) {
@@ -182,10 +202,10 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
         for (ptrdiff_t i = 0; i < (ptrdiff_t)total; ++i) C[i] *= beta;
     }
 
-    // Tuned block sizes (good starting points on AVX-512):
-    if (Mb <= 0) Mb = 192;                 // rows per macro-tile
-    if (Nb <= 0) Nb = 256;                 // cols per B panel (multiple of 8)
-    if (Kb <= 0) Kb = 384;                 // depth of K slab (fits L2 with A-pack)
+    // Tuned defaults
+    if (Mb <= 0) Mb = 192;
+    if (Nb <= 0) Nb = 256;                 // multiple of 16
+    if (Kb <= 0) Kb = 384;                 // 256–512 are good candidates
 
     std::vector<float> Bp; Bp.resize((size_t)Kb * Nb);
 
@@ -212,25 +232,30 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
                     for (int m1 = m0; m1 < m0 + Mp; m1 += mr) {
                         const int mr_eff = std::min(mr, m0 + Mp - m1);
 
-                        // Pack A micro-panel once per (m1, k0..k0+Kp)
-                        pack_A_micropanel_colmajor(A, ldA, m1, k0, mr, mr_eff, Kp, Ap_thread);
+                        // Pack A once for this (m1, k0..k0+Kp), with alpha applied.
+                        pack_A_micropanel_colmajor_alpha(
+                            A, ldA, m1, k0, mr, mr_eff, Kp, alpha, Ap_thread);
 
-                        // Walk columns in n1..n1+8 tiles
-                        for (int n1 = n0; n1 < n0 + Np; n1 += GEMM_NR) {
-                            const int nr_eff = std::min(GEMM_NR, n0 + Np - n1);
+                        // Process N in 16-wide tiles, then an 8-wide tail, then scalar tail if needed.
+                        int n1 = 0;
+                        for (; n1 + 16 <= Np; n1 += 16) {
+                            float*       Cblk    = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bp_tile = Bp.data() + (size_t)n1 * Kp;
 
-                            float* __restrict Cblk = C + (size_t)m1 * ldC + n1;
-                            const float* __restrict Bp_tile = Bp.data() + (size_t)(n1 - n0) * Kp;
-
-                            kernel_16x8_f32_avx512(
+                            kernel_16x16_f32_avx512(
                                 Ap_thread, Bp_tile,
-                                Kp, nr_eff,
-                                ldC, Cblk,
-                                alpha,
-                                first_panel,
-                                last_panel,
-                                mr_eff
-                            );
+                                Kp, 16, ldC, Cblk,
+                                first_panel, last_panel, mr_eff);
+                        }
+                        if (n1 < Np) {
+                            const int nr_eff = Np - n1; // 1..15
+                            float*       Cblk    = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bp_tile = Bp.data() + (size_t)n1 * Kp;
+
+                            kernel_16x16_f32_avx512(
+                                Ap_thread, Bp_tile,
+                                Kp, nr_eff, ldC, Cblk,
+                                first_panel, last_panel, mr_eff);
                         }
                     }
                 }
@@ -240,4 +265,6 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
         } // k0
     } // n0
 }
-}
+
+
+} // namespace gemm
