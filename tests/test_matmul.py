@@ -1,5 +1,5 @@
 import numpy as np, torch
-import _attn_cpu as cpu
+import attn_cpu as cpu
 
 M, K, N = 128, 192, 96
 A = np.random.randn(M, K).astype(np.float32)
