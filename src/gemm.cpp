@@ -7,6 +7,7 @@
 #include <immintrin.h>
 #include <omp.h>
 #include "kernels/microkernel_16x8_avx512.h"
+#include "kernels/gemm_kernels_avx512.h"
 
 // Prefetch distances (in "k" elements)
 #ifndef GEMM_PREFETCH_DIST_K
@@ -38,6 +39,27 @@ inline void pack_B_panel_colmajor(const float* B, int ldB,
         float*       Bj_dst = Bp + j * Kp;
         for (int k = 0; k < Kp; ++k) {
             Bj_dst[k] = Bj_src[(k0 + k) * ldB];
+        }
+    }
+}
+
+inline void pack_B_panel_k_interleaved(const float* B, int ldB,
+                                       int k0, int n0,
+                                       int Kp, int Np, int NRblk,
+                                       float* Bp)
+{
+    const int groups = (Np + NRblk - 1) / NRblk;
+    for (int g = 0; g < groups; ++g) {
+        const int j0 = g * NRblk;
+        const int nr_eff = std::min(NRblk, Np - j0);
+        float* Bg = Bp + (size_t)g * Kp * NRblk;
+        for (int k = 0; k < Kp; ++k) {
+            const float* Bsrc = B + (k0 + k) * (size_t)ldB + (n0 + j0);
+            float*       Bdst = Bg + (size_t)k * NRblk;
+            // copy the real columns
+            std::memcpy(Bdst, Bsrc, (size_t)nr_eff * sizeof(float));
+            // zero-pad the rest
+            for (int j = nr_eff; j < NRblk; ++j) Bdst[j] = 0.0f;
         }
     }
 }
@@ -81,6 +103,7 @@ inline void pack_A_micropanel_colmajor_alpha(const float* A, int ldA,
         for (; r < mr; ++r) Ap[k*mr + r] = 0.0f;
     }
 }
+
 
 
 // ---------------------------- AVX-512 microkernel -----------------------------
@@ -186,76 +209,96 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
                    int Mb, int Nb, int Kb,
                    int mr, int nr, int ku)
 {
-    // Fixed kernel shape
-    mr = GEMM_MR;                    // 16
-    nr = std::clamp(nr, 1, GEMM_NR_FULL); // up to 16
-    ku = std::clamp(ku, 1, GEMM_KU); // up to 8
+    // Fixed kernel shape we’ll target
+    const int MR = 16;
+    const int NRblk = 16;   // k-interleaved group width
+    const int KU = 8;
+
+    mr = MR; ku = KU; // ignore user overrides here (simplify)
 
     const int ldA = K, ldB = N, ldC = N;
 
-    // beta handling
-    if (beta == 0.0f) {
-        std::fill(C, C + (size_t)M * N, 0.0f);
-    } else if (beta != 1.0f) {
-        const size_t total = (size_t)M * N;
-        #pragma omp parallel for if (total > (1<<15))
-        for (ptrdiff_t i = 0; i < (ptrdiff_t)total; ++i) C[i] *= beta;
+    // Don't touch C if beta==0; first panel will write it
+    if (beta != 0.0f) {
+        if (beta != 1.0f) {
+            const size_t total = (size_t)M * N;
+            #pragma omp parallel for if (total > (1<<15))
+            for (ptrdiff_t i = 0; i < (ptrdiff_t)total; ++i) C[i] *= beta;
+        }
     }
 
-    // Tuned defaults
-    if (Mb <= 0) Mb = 192;
-    if (Nb <= 0) Nb = 256;                 // multiple of 16
-    if (Kb <= 0) Kb = 384;                 // 256–512 are good candidates
+    // Block sizes for SKX (1 MiB L2): keep Ap(16×Kb) + Bpk(NR×Kb) ~ 32 KB
+    if (Mb <= 0) Mb = 128;      // 128 or 192
+    if (Nb <= 0) Nb = 256;      // multiple of 16
+    if (Kb <= 0) Kb = 256;      // 256 fits L1 nicely with NR=16
 
-    std::vector<float> Bp; Bp.resize((size_t)Kb * Nb);
+    // Bp size: groups * Kp * NRblk
+    std::vector<float> Bp; Bp.resize((size_t)((Nb + NRblk - 1)/NRblk) * Kb * NRblk);
 
     for (int n0 = 0; n0 < N; n0 += Nb) {
         const int Np = std::min(Nb, N - n0);
+        const int groups_panel = (Np + NRblk - 1) / NRblk;
 
         for (int k0 = 0; k0 < K; k0 += Kb) {
             const int Kp = std::min(Kb, K - k0);
 
-            // Pack B panel [Kp x Np]
-            pack_B_panel_colmajor(B, ldB, k0, n0, Kp, Np, Bp.data());
+            // Pack B panel once (k-interleaved per NRblk group)
+            pack_B_panel_k_interleaved(B, ldB, k0, n0, Kp, Np, NRblk, Bp.data());
 
-            const bool first_panel = (k0 == 0) && (beta == 0.0f);
-            const bool last_panel  = (k0 + Kp == K);
+            const bool first_panel = (beta == 0.0f) && (k0 == 0);
 
             #pragma omp parallel
             {
-                float* Ap_thread = (float*)_mm_malloc(sizeof(float) * (size_t)Kp * mr, 64);
+                float* Ap_thread = (float*)_mm_malloc(sizeof(float) * (size_t)Kp * MR, 64);
 
                 #pragma omp for schedule(static)
                 for (int m0 = 0; m0 < M; m0 += Mb) {
                     const int Mp = std::min(Mb, M - m0);
 
-                    for (int m1 = m0; m1 < m0 + Mp; m1 += mr) {
-                        const int mr_eff = std::min(mr, m0 + Mp - m1);
+                    for (int m1 = m0; m1 < m0 + Mp; m1 += MR) {
+                        const int mr_eff = std::min(MR, m0 + Mp - m1);
 
-                        // Pack A once for this (m1, k0..k0+Kp), with alpha applied.
+                        // Pack A with alpha once per (m1, k0..k0+Kp)
                         pack_A_micropanel_colmajor_alpha(
-                            A, ldA, m1, k0, mr, mr_eff, Kp, alpha, Ap_thread);
+                            A, ldA, m1, k0, MR, mr_eff, Kp, alpha, Ap_thread);
 
-                        // Process N in 16-wide tiles, then an 8-wide tail, then scalar tail if needed.
+                        // Walk N in 16-wide groups, then 12/8 tails
                         int n1 = 0;
                         for (; n1 + 16 <= Np; n1 += 16) {
-                            float*       Cblk    = C + (size_t)m1 * ldC + (n0 + n1);
-                            const float* Bp_tile = Bp.data() + (size_t)n1 * Kp;
+                            const int g = n1 / NRblk;
+                            float*       Cblk = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bpg  = Bp.data() + (size_t)g * Kp * NRblk;
 
-                            kernel_16x16_f32_avx512(
-                                Ap_thread, Bp_tile,
-                                Kp, 16, ldC, Cblk,
-                                first_panel, last_panel, mr_eff);
+                            kernel_16xNR_f32_kinter<16>(
+                                Ap_thread, Bpg, Kp, ldC, Cblk, first_panel, mr_eff);
                         }
-                        if (n1 < Np) {
-                            const int nr_eff = Np - n1; // 1..15
-                            float*       Cblk    = C + (size_t)m1 * ldC + (n0 + n1);
-                            const float* Bp_tile = Bp.data() + (size_t)n1 * Kp;
+                        if (n1 + 12 <= Np) {
+                            const int g = n1 / NRblk;
+                            float*       Cblk = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bpg  = Bp.data() + (size_t)g * Kp * NRblk;
 
-                            kernel_16x16_f32_avx512(
-                                Ap_thread, Bp_tile,
-                                Kp, nr_eff, ldC, Cblk,
-                                first_panel, last_panel, mr_eff);
+                            kernel_16xNR_f32_kinter<12>(
+                                Ap_thread, Bpg, Kp, ldC, Cblk, first_panel, mr_eff);
+                            n1 += 12;
+                        }
+                        if (n1 + 8 <= Np) {
+                            const int g = n1 / NRblk;
+                            float*       Cblk = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bpg  = Bp.data() + (size_t)g * Kp * NRblk;
+
+                            kernel_16xNR_f32_kinter<8>(
+                                Ap_thread, Bpg, Kp, ldC, Cblk, first_panel, mr_eff);
+                            n1 += 8;
+                        }
+                        // scalar residue (rare with N multiple of 16)
+                        for (; n1 < Np; ++n1) {
+                            const int g = n1 / NRblk;
+                            float*       Cblk = C + (size_t)m1 * ldC + (n0 + n1);
+                            const float* Bpg  = Bp.data() + (size_t)g * Kp * NRblk;
+
+                            // trivial 16×1: reuse NR=8 kernel twice if you like; or do a tiny loop
+                            kernel_16xNR_f32_kinter<8>(
+                                Ap_thread, Bpg, Kp, ldC, Cblk, first_panel, mr_eff);
                         }
                     }
                 }
@@ -265,6 +308,5 @@ void sgemm_blocked(const float* __restrict A, int M, int K,
         } // k0
     } // n0
 }
-
 
 } // namespace gemm
