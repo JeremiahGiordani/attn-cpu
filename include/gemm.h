@@ -13,4 +13,10 @@ void sgemm_blocked(const float* A, int M, int K,
                    float* C,
                    float alpha = 1.0f, float beta = 0.0f);
 
+
+void gemm_blocked_jit(const float* A, int M, int K,
+                   const float* B, int N,
+                   float* C,
+                   float alpha = 1.0f, float beta = 0.0f);
+
 } // namespace gemm

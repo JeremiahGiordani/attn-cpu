@@ -26,21 +26,28 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # endif()
 
 
-if (MSVC)
-  add_compile_options(/O2 /fp:fast)
-else()
-  add_compile_options(-O3 -ffast-math -fopenmp -fno-math-errno -funroll-loops -fno-trapping-math -fno-omit-frame-pointer)
-  if (ATTN_NATIVE_OPT)
-    add_compile_options(-march=native)
-  endif()
-endif()
 
+# if (MSVC)
+#   add_compile_options(/O2 /fp:fast)
+# else()
+#   add_compile_options(-O3 -ffast-math -fopenmp -fno-math-errno -funroll-loops -fno-trapping-math -fno-omit-frame-pointer)
+#   if (ATTN_NATIVE_OPT)
+#     add_compile_options(-march=native)
+#   endif()
+# endif()
+
+# add_compile_options(-O3 -Ofast -march=native -fopenmp -ffast-math -funroll-loops -frename-registers -std=c++17 -DNDEBUG)
+add_compile_options(-O3 -ffast-math -fopenmp -fno-math-errno -funroll-loops -fno-trapping-math -fno-omit-frame-pointer)
+
+add_compile_options(-march=native)
 # if (ATTN_USE_AVX512)
 #   add_compile_definitions(ATTN_USE_AVX512=1)
 #   if (NOT MSVC)
 #     add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl)
 #   endif()
 # endif()
+
+
 
 # Optional OpenMP
 if (ATTN_USE_OPENMP)
@@ -53,12 +60,14 @@ endif()
 
 # Third-party (vendored)
 add_subdirectory(third_party/pybind11)
+add_subdirectory(third_party/xbyak)
 # add_subdirectory(third_party/llama.cpp)  # not used yet in M0
 
 # ---------- Library target ----------
 add_library(attn STATIC
   src/attn_dispatch.cpp 
   src/gemm.cpp 
+  src/jit_gemm.cpp 
 )
 
 target_include_directories(attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -66,6 +75,8 @@ target_include_directories(attn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if (ATTN_USE_OPENMP AND OpenMP_CXX_FOUND)
   target_link_libraries(attn PUBLIC OpenMP::OpenMP_CXX)
 endif()
+
+target_include_directories(attn PRIVATE ${CMAKE_SOURCE_DIR}/third_party/xbyak)
 
 # ---------- Python module ----------
 if (ATTN_BUILD_PYTHON)
