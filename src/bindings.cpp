@@ -49,9 +49,7 @@ py::array_t<float> gemm_py(
     py::array_t<float, py::array::c_style | py::array::forcecast> A,
     py::array_t<float, py::array::c_style | py::array::forcecast> B,
     float alpha = 1.0f,
-    float beta  = 0.0f,
-    int Mb = 192, int Nb = 144, int Kb = 256,
-    int mr = 16, int nr = 12, int ku = 4)
+    float beta  = 0.0f)
 {
     if (A.ndim() != 2 || B.ndim() != 2)
         throw std::invalid_argument("A and B must be 2D: A[M,K], B[K,N]");
@@ -69,9 +67,7 @@ py::array_t<float> gemm_py(
         A.data(), M, K,
         B.data(), N,
         C.mutable_data(),
-        alpha, beta,
-        Mb, Nb, Kb,
-        mr, nr, ku
+        alpha, beta
     );
     return C;
 }
@@ -88,8 +84,6 @@ PYBIND11_MODULE(_attn_cpu, m) {
           py::arg("A"), py::arg("B"),
           py::arg("alpha") = 1.0f,
           py::arg("beta")  = 0.0f,
-          py::arg("Mb") = 256, py::arg("Nb") = 96, py::arg("Kb") = 288,
-          py::arg("mr") = 16,  py::arg("nr") = 24, py::arg("ku") = 4,
           "Blocked SGEMM: C = alpha * A@B + beta*C, A:[M,K], B:[K,N] -> C:[M,N]\n"
           "Tunables default to AVX-512-friendly picks. Pass num_threads>0 to set OpenMP threads."
     );

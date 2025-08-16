@@ -19,6 +19,6 @@ def mha_block_dense(x: np.ndarray, W_in: np.ndarray, b_in: np.ndarray, W_out: np
 # 2048×1280×960
 def gemm(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     # return _gemm(A, B)
-    return _gemm(A, B, float(1.0), float(0.0), 256, 1024, 512, 16, 12, 4)
+    return _gemm(A, B)
 
 

@@ -16,21 +16,31 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
 # Compile flags
+# if (MSVC)
+#   add_compile_options(/O2 /fp:fast)
+# else()
+#   add_compile_options(-O3 -ffast-math -fopenmp -fexceptions)
+#   if (ATTN_NATIVE_OPT)
+#     add_compile_options(-march=skylake-avx512)
+#   endif()
+# endif()
+
+
 if (MSVC)
   add_compile_options(/O2 /fp:fast)
 else()
-  add_compile_options(-O3 -ffast-math -fno-math-errno -fno-trapping-math -fno-omit-frame-pointer)
+  add_compile_options(-O3 -ffast-math -fopenmp -fno-math-errno -funroll-loops -fno-trapping-math -fno-omit-frame-pointer)
   if (ATTN_NATIVE_OPT)
     add_compile_options(-march=native)
   endif()
 endif()
 
-if (ATTN_USE_AVX512)
-  add_compile_definitions(ATTN_USE_AVX512=1)
-  if (NOT MSVC)
-    add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl)
-  endif()
-endif()
+# if (ATTN_USE_AVX512)
+#   add_compile_definitions(ATTN_USE_AVX512=1)
+#   if (NOT MSVC)
+#     add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl)
+#   endif()
+# endif()
 
 # Optional OpenMP
 if (ATTN_USE_OPENMP)
