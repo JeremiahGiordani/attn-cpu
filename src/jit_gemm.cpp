@@ -369,8 +369,10 @@ template<int NR, int UNROLL>
 static inline auto pick_by_kc(int kc)->typename Jit8xNR_Beta0<NR,UNROLL,768>::Fn {
 #ifndef STRICT_NUMERICS
   switch (kc) {
+    case 512: return get_jit_kernel<NR,UNROLL,512>();
     case 640: return get_jit_kernel<NR,UNROLL,640>();
     case 768: return get_jit_kernel<NR,UNROLL,768>();
+    case 832: return get_jit_kernel<NR,UNROLL,832>();
     default:  return get_jit_kernel<NR,UNROLL,896>();
   }
 #else
@@ -421,7 +423,7 @@ static inline auto pick_jit(int NR, int UNROLL, int KC_L1)
 struct KernelConfig {
   int NR;        // 16, 32, or 48
   int UNROLL;    // 1..8 (feasible combos only)
-  int KC_L1;     // 640, 768, 896 (or huge if STRICT_NUMERICS)
+  int KC_L1;     // 512, 640, 768, 832, 896 (or huge if STRICT_NUMERICS)
 };
 
 static inline const char* cfg_str(const KernelConfig& c) {
@@ -459,7 +461,7 @@ static void autotune_once(const float* A, int M, int K,
                           float* C)
 {
 #ifndef STRICT_NUMERICS
-  static constexpr int KCs[] = {640, 768, 896};
+  static constexpr int KCs[] = {512, 640, 768, 832, 896};
 #else
   static constexpr int KCs[] = {(1<<30)};
 #endif
