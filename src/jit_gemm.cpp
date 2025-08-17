@@ -1,17 +1,20 @@
-// jit_gemm.cpp — AVX-512 SGEMM with Xbyak JIT micro-kernel + prefetching
-// Notes:
-//  - Fast path (default): K split into L1 panels (KC_L1), k-unroll=2, NT stores.
-//  - Optional STRICT_NUMERICS: process full K in one pass (no K panels).
+// jit_gemm.cpp — AVX-512 SGEMM with Xbyak JIT micro-kernels
+// Baseline: prefetching + one-shot autotune of (NR, K_UNROLL, KC_L1), cached.
 //
-// Build: g++ -O3 -march=native -fopenmp -Ithird_party/xbyak src/jit_gemm.cpp -c
-// For stricter accumulation order: -DSTRICT_NUMERICS=1
+// Build: g++ -O3 -march=native -fopenmp -Ithird_party/xbyak -c src/jit_gemm.cpp
+// Macros: -DSTRICT_NUMERICS=1 to disable K panel split inside kernels.
 
 #include <immintrin.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <mutex>
+#include <array>
+#include <atomic>
 #include <omp.h>
+#include <iostream>
 #if defined(__linux__)
   #include <sys/mman.h>
 #endif
@@ -20,22 +23,20 @@
 namespace gemm {
 
 // ===================== Tunables (prefetch-only) ======================
-// Prefetch distances are in iterations-ahead and converted to bytes
-// in the JIT so the kernel doesn't do runtime math.
-// Keep these modest; too far risks cache pollution.
 static constexpr int PF_DIST_ITER_U2 = 2;  // JIT k-loop (k-unroll=2) lookahead
 static constexpr int PF_DIST_ITER_U1 = 4;  // JIT tail (k-unroll=1) lookahead
-static constexpr int PF_KDIST_BETA   = 16; // β≠0 path: prefetch A/B k-rows ahead
-static constexpr bool PF_PACKERS     = true; // enable pack-time prefetch (safe)
+static constexpr int PF_KDIST_BETA   = 16; // β≠0 path prefetch distance
+static constexpr bool PF_PACKERS     = true;
 
 // ============================ Blocking ===============================
-static constexpr int MR    = 8;
-static constexpr int NR    = 48;
+static constexpr int MR = 8;          // fixed (register-row block)
+static constexpr int NR_48 = 48;
+static constexpr int NR_32 = 32;
 
 #ifndef STRICT_NUMERICS
-static constexpr int KC_L1 = 768;   // MR*KC_L1*4 ≈ 24KB of A slab in L1
+// KC_L1 is baked into the JIT micro-kernel (panel split inside kernel)
 #else
-static constexpr int KC_L1 = 1 << 30; // effectively "no panel split"
+// If STRICT_NUMERICS, KC_L1 becomes effectively huge (one pass)
 #endif
 
 // ============================ Utilities ==============================
@@ -73,12 +74,9 @@ static inline void pack_A_tile_mrK(const float* __restrict A, int ldA,
     const float* a_col = A + k;
     float* dst = Ap + (size_t)k * MR;
 
-    // Light prefetch on source (helps when ldA is large)
     if constexpr (PF_PACKERS) {
-      int k_pf = k + 8; // small, safe lookahead
-      if (k_pf < K) {
-        _mm_prefetch(reinterpret_cast<const char*>(A + k_pf), _MM_HINT_T0);
-      }
+      int k_pf = k + 8;
+      if (k_pf < K) _mm_prefetch(reinterpret_cast<const char*>(A + k_pf), _MM_HINT_T0);
     }
 
     int r = 0;
@@ -87,9 +85,10 @@ static inline void pack_A_tile_mrK(const float* __restrict A, int ldA,
   }
 }
 
-static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
-                                   int K, int nr_eff,
-                                   float* __restrict Bp) {
+template<int NR>
+static inline void pack_B_tile_Knr_NR(const float* __restrict B, int ldB,
+                                      int K, int nr_eff,
+                                      float* __restrict Bp) {
   for (int k = 0; k < K; ++k) {
     const float* b_row = B + (size_t)k * ldB;
     float* dst = Bp + (size_t)k * NR;
@@ -107,34 +106,139 @@ static inline void pack_B_tile_Knr(const float* __restrict B, int ldB,
   }
 }
 
-// ========== JIT 8×48, k-unroll=2, beta==0, aligned-B, NT stores ======
-struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
+// ===================== Tails / β!=0 portable path ====================
+static inline void microkernel_tail_scalar(
+    const float* __restrict Ap, const float* __restrict Bp,
+    float* __restrict C, int ldc,
+    int K, int mr_eff, int nr_eff, int NR_stride, float beta)
+{
+  for (int r = 0; r < mr_eff; ++r) {
+    for (int j = 0; j < nr_eff; ++j) {
+      float acc = 0.f;
+      for (int kk = 0; kk < K; ++kk)
+        acc += Ap[(size_t)kk*MR + r] * Bp[(size_t)kk*NR_stride + j];
+      float* cptr = C + (size_t)r * ldc + j;
+      if (beta == 0.0f) *cptr = acc;
+      else if (beta == 1.0f) *cptr += acc;
+      else *cptr = acc + beta * (*cptr);
+    }
+  }
+}
+
+template<int NR, int KC_L1>
+static inline void beta_not_zero_fulltile_intrinsics(
+    const float* __restrict Ap, const float* __restrict Bp,
+    float* __restrict C_tile, int ldC, int K, float beta)
+{
+  constexpr int NB = NR / 16; // 2 for 32, 3 for 48
+  __m512 acc[MR][NB];
+  for (int r = 0; r < MR; ++r)
+    for (int b = 0; b < NB; ++b)
+      acc[r][b] = _mm512_setzero_ps();
+
+  for (int kbase = 0; kbase < K; kbase += KC_L1) {
+    int Kc = std::min(KC_L1, K - kbase);
+    const float* a_ptr = Ap + (size_t)kbase * MR;
+    const float* b_ptr = Bp + (size_t)kbase * NR;
+
+    int k = 0, kend = Kc & ~1;
+    for (; k < kend; k += 2) {
+      // Prefetch modestly ahead
+      int kpf = k + PF_KDIST_BETA;
+      if (kpf < Kc) {
+        _mm_prefetch(reinterpret_cast<const char*>(b_ptr + (size_t)kpf * NR), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(a_ptr + (size_t)kpf * MR), _MM_HINT_T0);
+      }
+
+      const float* bk0 = b_ptr + (size_t)k * NR;
+      const float* bk1 = bk0 + NR;
+
+      __m512 Bk0[NB], Bk1[NB];
+      for (int b = 0; b < NB; ++b) {
+        Bk0[b] = _mm512_load_ps(bk0 + b*16);
+        Bk1[b] = _mm512_load_ps(bk1 + b*16);
+      }
+
+      for (int r = 0; r < MR; ++r) {
+        __m512 A0 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + r));
+        __m512 A1 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + MR + r));
+        for (int b = 0; b < NB; ++b) {
+          acc[r][b] = _mm512_fmadd_ps(A0, Bk0[b], acc[r][b]);
+          acc[r][b] = _mm512_fmadd_ps(A1, Bk1[b], acc[r][b]);
+        }
+      }
+      a_ptr += (size_t)2 * MR;
+    }
+
+    for (; k < Kc; ++k) {
+      int kpf = k + PF_KDIST_BETA;
+      if (kpf < Kc) {
+        _mm_prefetch(reinterpret_cast<const char*>(b_ptr + (size_t)kpf * NR), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(a_ptr + (size_t)kpf * MR), _MM_HINT_T0);
+      }
+      const float* bk = b_ptr + (size_t)k * NR;
+      __m512 Bk[NB];
+      for (int b = 0; b < NB; ++b) Bk[b] = _mm512_load_ps(bk + b*16);
+      for (int r = 0; r < MR; ++r) {
+        __m512 A0 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + r));
+        for (int b = 0; b < NB; ++b)
+          acc[r][b] = _mm512_fmadd_ps(A0, Bk[b], acc[r][b]);
+      }
+      a_ptr += MR;
+    }
+  }
+
+  // Warm C rows before RMW
+  for (int r = 0; r < MR; ++r) {
+    float* cptr = C_tile + (size_t)r * ldC;
+    for (int b = 0; b < (NR/16); ++b)
+      _mm_prefetch(reinterpret_cast<const char*>(cptr + b*16), _MM_HINT_T0);
+  }
+
+  __m512 vb = _mm512_set1_ps(beta);
+  for (int r = 0; r < MR; ++r) {
+    float* cptr = C_tile + (size_t)r * ldC;
+    for (int b = 0; b < (NR/16); ++b) {
+      __m512 c = _mm512_loadu_ps(cptr + b*16);
+      _mm512_storeu_ps(cptr + b*16, _mm512_fmadd_ps(c, vb, acc[r][b]));
+    }
+  }
+}
+
+// ================== JIT micro-kernels (beta==0, aligned B) ===========
+// Generic generator for NR ∈ {32,48}, UNROLL ∈ {1,2}, KC_L1 baked in.
+template<int NR, int UNROLL, int KC_L1>
+struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
   using Fn = void(*)(const float*, const float*, float*, int, int, int);
-  Jit8x48_Beta0_Align() {
+  Jit8xNR_Beta0() {
     using namespace Xbyak;
+
+    constexpr int NB = NR / 16;
+    // Register budget: acc = MR*NB, B regs = NB*UNROLL, 2 broadcast
+    static_assert(NB == 2 || NB == 3, "NR must be 32 or 48");
+    static_assert(UNROLL == 1 || UNROLL == 2, "UNROLL must be 1 or 2");
+    static_assert(MR*NB + NB*UNROLL + 2 <= 32, "AVX-512 zmm register pressure!");
 
     const Reg64 Ap = rdi, Bp = rsi, C = rdx, ldc = rcx, K = r8, stream = r9;
     const Reg64 kbase = r10, a_ptr = r11, b_ptr = r12, c_row = r13, ldc_bytes = r14;
     const Reg64 tmp = r15, kcnt = rax, Kc = rbx;
 
-    // Compile-time byte offsets for prefetch (avoid runtime math)
+    // Prefetch byte distances (compile-time)
     static constexpr int APF_U2 = MR * 2 * 4 * PF_DIST_ITER_U2;
     static constexpr int BPF_U2 = NR * 2 * 4 * PF_DIST_ITER_U2;
     static constexpr int APF_U1 = MR * 1 * 4 * PF_DIST_ITER_U1;
     static constexpr int BPF_U1 = NR * 1 * 4 * PF_DIST_ITER_U1;
 
-    // prologue (save callee-saved we use)
+    // prologue
     push(rbp); mov(rbp, rsp);
     push(rbx); push(r12); push(r13); push(r14); push(r15);
 
-    // zero accs
-    for (int r = 0; r < MR; ++r) vxorps(Zmm(0 + r),  Zmm(0 + r),  Zmm(0 + r));
-    for (int r = 0; r < MR; ++r) vxorps(Zmm(8 + r),  Zmm(8 + r),  Zmm(8 + r));
-    for (int r = 0; r < MR; ++r) vxorps(Zmm(16 + r), Zmm(16 + r), Zmm(16 + r));
+    // zero accs: zmm0..zmm(MR*NB-1)
+    for (int id = 0; id < MR*NB; ++id)
+      vxorps(Zmm(id), Zmm(id), Zmm(id));
 
     mov(ldc_bytes, ldc);
     imul(ldc_bytes, ldc_bytes, 4);
-
     xor_(kbase, kbase);
 
     Label L_outer, L_outer_done, L_panel_loop, L_panel_tail, L_panel_done, L_no_clamp;
@@ -142,12 +246,16 @@ struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
       cmp(kbase, K);
       jge(L_outer_done, T_NEAR);
 
+#ifndef STRICT_NUMERICS
       mov(kcnt, K); sub(kcnt, kbase);            // remaining
       mov(Kc, (uint64_t)KC_L1);                  // Kc = min(KC_L1, remaining)
       cmp(kcnt, KC_L1);
       jge(L_no_clamp, T_NEAR);
       mov(Kc, kcnt);
       L(L_no_clamp);
+#else
+      mov(Kc, K); sub(Kc, kbase);
+#endif
 
       mov(tmp, kbase); imul(tmp, tmp, MR*4);     // a_ptr = Ap + kbase*MR*4
       lea(a_ptr, ptr[Ap + tmp]);
@@ -156,58 +264,63 @@ struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
 
       mov(kcnt, Kc);
       L(L_panel_loop);
-        cmp(kcnt, 2);
+        cmp(kcnt, UNROLL);
         jl(L_panel_tail, T_NEAR);
 
-        // Prefetch future A/B (k-unroll=2 loop)
-        // We prefetch both the "current stream" (b_ptr) and the next row block (b_ptr + NR*4)
-        if (BPF_U2 > 0) {
-          prefetcht0(ptr[b_ptr + BPF_U2]);
-          prefetcht0(ptr[b_ptr + BPF_U2 + NR*4]);
-        }
-        if (APF_U2 > 0) {
-          prefetcht0(ptr[a_ptr + APF_U2]);
+        // Prefetch next bodies for UNROLL=2; for UNROLL=1 we still use PF_U1 below
+        if (UNROLL == 2) {
+          if (BPF_U2 > 0) {
+            prefetcht0(ptr[b_ptr + BPF_U2]);
+            if (NB >= 1) prefetcht0(ptr[b_ptr + BPF_U2 + NR*4]);
+          }
+          if (APF_U2 > 0) {
+            prefetcht0(ptr[a_ptr + APF_U2]);
+          }
         }
 
-        vmovaps(Zmm(24), ptr[b_ptr +  0*4]);       // B(k)
-        vmovaps(Zmm(25), ptr[b_ptr + 16*4]);
-        vmovaps(Zmm(26), ptr[b_ptr + 32*4]);
-        vmovaps(Zmm(27), ptr[b_ptr + NR*4 +  0*4]); // B(k+1)
-        vmovaps(Zmm(28), ptr[b_ptr + NR*4 + 16*4]);
-        vmovaps(Zmm(29), ptr[b_ptr + NR*4 + 32*4]);
+        // Load B rows for UNROLL steps
+        // We place B regs AFTER accumulators: baseB = MR*NB
+        const int baseB = MR*NB;
+        // emit loads for iter t in [0..UNROLL-1]
+        for (int t = 0; t < UNROLL; ++t) {
+          for (int b = 0; b < NB; ++b) {
+            vmovaps(Zmm(baseB + t*NB + b), ptr[b_ptr + (t*NR + b*16)*4]);
+          }
+        }
 
+        // FMAs
         for (int r = 0; r < MR; ++r) {
-          vbroadcastss(Zmm(30), ptr[a_ptr + r*4]);
-          vfmadd231ps(Zmm(0 + r),  Zmm(24), Zmm(30));
-          vfmadd231ps(Zmm(8 + r),  Zmm(25), Zmm(30));
-          vfmadd231ps(Zmm(16 + r), Zmm(26), Zmm(30));
-
-          vbroadcastss(Zmm(31), ptr[a_ptr + MR*4 + r*4]);
-          vfmadd231ps(Zmm(0 + r),  Zmm(27), Zmm(31));
-          vfmadd231ps(Zmm(8 + r),  Zmm(28), Zmm(31));
-          vfmadd231ps(Zmm(16 + r), Zmm(29), Zmm(31));
+          // For each UNROLL step
+          for (int t = 0; t < UNROLL; ++t) {
+            vbroadcastss(Zmm(30), ptr[a_ptr + (t*MR + r)*4]);
+            for (int b = 0; b < NB; ++b) {
+              // acc index layout: acc[b][r] -> zmm(b*MR + r)
+              vfmadd231ps(Zmm(b*MR + r), Zmm(baseB + t*NB + b), Zmm(30));
+            }
+          }
         }
 
-        add(a_ptr, MR*2*4);
-        add(b_ptr, NR*2*4);
-        sub(kcnt, 2);
+        add(a_ptr, MR*UNROLL*4);
+        add(b_ptr, NR*UNROLL*4);
+        sub(kcnt, UNROLL);
         jmp(L_panel_loop, T_NEAR);
 
       L(L_panel_tail);
         cmp(kcnt, 0);
         je(L_panel_done, T_NEAR);
 
-        if (BPF_U1 > 0) { prefetcht0(ptr[b_ptr + BPF_U1]); }
-        if (APF_U1 > 0) { prefetcht0(ptr[a_ptr + APF_U1]); }
+        if (BPF_U1 > 0) prefetcht0(ptr[b_ptr + BPF_U1]);
+        if (APF_U1 > 0) prefetcht0(ptr[a_ptr + APF_U1]);
 
-        vmovaps(Zmm(24), ptr[b_ptr +  0*4]);
-        vmovaps(Zmm(25), ptr[b_ptr + 16*4]);
-        vmovaps(Zmm(26), ptr[b_ptr + 32*4]);
+        // Load single B row (tail)
+        for (int b = 0; b < NB; ++b) {
+          vmovaps(Zmm(MR*NB + b), ptr[b_ptr + b*16*4]);
+        }
         for (int r = 0; r < MR; ++r) {
-          vbroadcastss(Zmm(30), ptr[a_ptr + r*4]);
-          vfmadd231ps(Zmm(0 + r),  Zmm(24), Zmm(30));
-          vfmadd231ps(Zmm(8 + r),  Zmm(25), Zmm(30));
-          vfmadd231ps(Zmm(16 + r), Zmm(26), Zmm(30));
+          vbroadcastss(Zmm(31), ptr[a_ptr + r*4]);
+          for (int b = 0; b < NB; ++b) {
+            vfmadd231ps(Zmm(b*MR + r), Zmm(MR*NB + b), Zmm(31));
+          }
         }
       L(L_panel_done);
 
@@ -224,9 +337,9 @@ struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
     for (int r = 0; r < MR; ++r) {
       mov(c_row, C);
       if (r != 0) { mov(tmp, ldc_bytes); imul(tmp, tmp, r); add(c_row, tmp); }
-      vmovntps(ptr[c_row +  0*4], Zmm(0  + r));
-      vmovntps(ptr[c_row + 16*4], Zmm(8  + r));
-      vmovntps(ptr[c_row + 32*4], Zmm(16 + r));
+      for (int b = 0; b < NB; ++b) {
+        vmovntps(ptr[c_row + (b*16)*4], Zmm(b*MR + r));
+      }
     }
     jmp(L_done_all, T_NEAR);
 
@@ -234,9 +347,9 @@ struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
     for (int r = 0; r < MR; ++r) {
       mov(c_row, C);
       if (r != 0) { mov(tmp, ldc_bytes); imul(tmp, tmp, r); add(c_row, tmp); }
-      vmovups(ptr[c_row +  0*4], Zmm(0  + r));
-      vmovups(ptr[c_row + 16*4], Zmm(8  + r));
-      vmovups(ptr[c_row + 32*4], Zmm(16 + r));
+      for (int b = 0; b < NB; ++b) {
+        vmovups(ptr[c_row + (b*16)*4], Zmm(b*MR + r));
+      }
     }
 
     L(L_done_all);
@@ -249,39 +362,185 @@ struct Jit8x48_Beta0_Align : public Xbyak::CodeGenerator {
   Fn get() const { return getCode<Fn>(); }
 };
 
-static Jit8x48_Beta0_Align::Fn jit_kernel_8x48_beta0_aligned() {
-  static Jit8x48_Beta0_Align gen;
+// -------- JIT kernel factory (lazy singletons per config) -------------
+enum : int { UNR1 = 1, UNR2 = 2 };
+
+template<int NR, int UNROLL, int KC_L1>
+static typename Jit8xNR_Beta0<NR,UNROLL,KC_L1>::Fn get_jit_kernel() {
+  static Jit8xNR_Beta0<NR,UNROLL,KC_L1> gen;
   return gen.get();
 }
 
-// ======================= Portable tails / β!=0 =======================
-static inline void microkernel_tail_scalar(
-    const float* __restrict Ap, const float* __restrict Bp,
-    float* __restrict C, int ldc,
-    int K, int mr_eff, int nr_eff, float beta)
-{
-  for (int r = 0; r < mr_eff; ++r) {
-    for (int j = 0; j < nr_eff; ++j) {
-      float acc = 0.f;
-      for (int kk = 0; kk < K; ++kk)
-        acc += Ap[(size_t)kk*MR + r] * Bp[(size_t)kk*NR + j];
-      float* cptr = C + (size_t)r * ldc + j;
-      if (beta == 0.0f) *cptr = acc;
-      else if (beta == 1.0f) *cptr += acc;
-      else *cptr = acc + beta * (*cptr);
-    }
-  }
+// =================== Config, tuner, and dispatcher ====================
+struct KernelConfig {
+  int NR;        // 32 or 48
+  int UNROLL;    // 1 or 2
+  int KC_L1;     // 640,768,896 (or large if STRICT_NUMERICS)
+};
+
+static inline const char* cfg_str(const KernelConfig& c) {
+  static thread_local char buf[64];
+  std::snprintf(buf, sizeof(buf), "NR=%d, UNROLL=%d, KC_L1=%d", c.NR, c.UNROLL, c.KC_L1);
+  return buf;
 }
 
-// ============================== Top-level ============================
-void gemm_blocked_jit(const float* A, int M, int K,
-                      const float* B, int N,
-                      float* C,
-                      float alpha, float beta)
+static KernelConfig g_cfg{};
+static std::once_flag g_once;
+
+static inline void select_default_cfg() {
+#ifndef STRICT_NUMERICS
+  g_cfg = {NR_48, UNR2, 768};
+#else
+  g_cfg = {NR_48, UNR2, (1<<30)};
+#endif
+}
+
+// Forward decl of the configurable implementation used for timing
+static void gemm_blocked_jit_impl(const float* A, int M, int K,
+                                  const float* B, int N, float* C,
+                                  float alpha, float beta,
+                                  const KernelConfig& cfg);
+
+// Autotune: try a small grid, pick the fastest on the *actual* M,N,K
+static void autotune_once(const float* A, int M, int K,
+                          const float* B, int N,
+                          float* C)
+{
+  // Candidate grid (conservative)
+#ifndef STRICT_NUMERICS
+  static constexpr int KCs[] = {640, 768, 896};
+#else
+  static constexpr int KCs[] = {(1<<30)};
+#endif
+  static constexpr int NRs[] = {NR_48, NR_32};
+  static constexpr int UNRs[] = {UNR2, UNR1};
+
+  double best_t = std::numeric_limits<double>::infinity();
+  KernelConfig best{};
+  bool found = false;
+
+  // Make scratch copies so we don't corrupt user buffers during timing
+  const int ldA = K, ldB = N, ldC = N;
+  size_t sizeA = (size_t)M * ldA;
+  size_t sizeB = (size_t)K * ldB;
+  size_t sizeC = (size_t)M * ldC;
+
+  float* A_s = aligned_alloc64(sizeA);
+  float* B_s = aligned_alloc64(sizeB);
+  float* C_s = aligned_alloc64(sizeC);
+  if (!A_s || !B_s || !C_s) { // fallback to default if allocation fails
+    if (A_s) aligned_free64(A_s);
+    if (B_s) aligned_free64(B_s);
+    if (C_s) aligned_free64(C_s);
+    select_default_cfg();
+    return;
+  }
+  std::memcpy(A_s, A, sizeA * sizeof(float));
+  std::memcpy(B_s, B, sizeB * sizeof(float));
+  std::memset(C_s, 0, sizeC * sizeof(float));
+
+  // Small warmup & timed loops
+  for (int NRv : NRs) {
+    for (int UNv : UNRs) {
+      for (int KCv : KCs) {
+        KernelConfig cfg{NRv, UNv, KCv};
+
+        // one warmup (beta=0 path), re-zero C each time
+        std::memset(C_s, 0, sizeC * sizeof(float));
+        gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+
+        // 3 timed runs
+        const int RUNS = 3;
+        double tsum = 0.0;
+        for (int r = 0; r < RUNS; ++r) {
+          std::memset(C_s, 0, sizeC * sizeof(float));
+          double t0 = omp_get_wtime();
+          gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+          double t1 = omp_get_wtime();
+          tsum += (t1 - t0);
+        }
+        double tavg = tsum / RUNS;
+
+        if (tavg < best_t) {
+          best_t = tavg;
+          best = cfg;
+          found = true;
+        }
+      }
+    }
+  }
+
+  if (found) g_cfg = best;
+  else       select_default_cfg();
+
+  aligned_free64(C_s);
+  aligned_free64(B_s);
+  aligned_free64(A_s);
+}
+
+// ================= Configurable dispatcher implementation =============
+template<int NR, int UNROLL, int KC_L1>
+static inline typename Jit8xNR_Beta0<NR,UNROLL,KC_L1>::Fn pick_jit_ptr() {
+  return get_jit_kernel<NR,UNROLL,KC_L1>();
+}
+
+static inline auto pick_jit(const KernelConfig& cfg) {
+  using Fn = typename Jit8xNR_Beta0<NR_48,UNR2,768>::Fn;
+#ifndef STRICT_NUMERICS
+  switch (cfg.NR) {
+    case NR_48:
+      if (cfg.UNROLL == UNR2) {
+        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_48,UNR2,640>();
+        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_48,UNR2,768>();
+        return (Fn)pick_jit_ptr<NR_48,UNR2,896>();
+      } else {
+        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_48,UNR1,640>();
+        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_48,UNR1,768>();
+        return (Fn)pick_jit_ptr<NR_48,UNR1,896>();
+      }
+    case NR_32:
+      if (cfg.UNROLL == UNR2) {
+        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_32,UNR2,640>();
+        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_32,UNR2,768>();
+        return (Fn)pick_jit_ptr<NR_32,UNR2,896>();
+      } else {
+        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_32,UNR1,640>();
+        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_32,UNR1,768>();
+        return (Fn)pick_jit_ptr<NR_32,UNR1,896>();
+      }
+    default: // fallback
+      return (Fn)pick_jit_ptr<NR_48,UNR2,768>();
+  }
+#else
+  // STRICT_NUMERICS: no panel split
+  constexpr int KCHuge = (1<<30);
+  switch (cfg.NR) {
+    case NR_48:
+      return (cfg.UNROLL==UNR2) ? (Fn)pick_jit_ptr<NR_48,UNR2,KCHuge>()
+                                : (Fn)pick_jit_ptr<NR_48,UNR1,KCHuge>();
+    case NR_32:
+      return (cfg.UNROLL==UNR2) ? (Fn)pick_jit_ptr<NR_32,UNR2,KCHuge>()
+                                : (Fn)pick_jit_ptr<NR_32,UNR1,KCHuge>();
+    default:
+      return (Fn)pick_jit_ptr<NR_48,UNR2,KCHuge>();
+  }
+#endif
+}
+
+static inline int nr_blocks_for(int NR) { return NR/16; }
+
+// Main configurable implementation (used by both autotuner and API)
+static void gemm_blocked_jit_impl(const float* A, int M, int K,
+                                  const float* B, int N,
+                                  float* C,
+                                  float alpha, float beta,
+                                  const KernelConfig& cfg)
 {
   if (M <= 0 || N <= 0 || K <= 0) return;
 
   const int ldA = K, ldB = N, ldC = N;
+  const int NRv  = cfg.NR;
+  const int NBv  = nr_blocks_for(NRv);
 
   if (alpha == 0.0f) {
 #pragma omp parallel for schedule(static)
@@ -294,10 +553,10 @@ void gemm_blocked_jit(const float* A, int M, int K,
   }
 
   const int MT = (M + MR - 1) / MR;
-  const int NT = (N + NR - 1) / NR;
+  const int NT = (N + NRv - 1) / NRv;
 
-  const size_t A_pack_elems = (size_t)MT * (size_t)K * (size_t)MR;
-  const size_t B_pack_elems = (size_t)NT * (size_t)K * (size_t)NR;
+  const size_t A_pack_elems = (size_t)MT * (size_t)K  * (size_t)MR;
+  const size_t B_pack_elems = (size_t)NT * (size_t)K  * (size_t)NRv;
   float* A_pack = aligned_alloc64(A_pack_elems);
   float* B_pack = aligned_alloc64(B_pack_elems);
 #if defined(__linux__)
@@ -315,139 +574,70 @@ void gemm_blocked_jit(const float* A, int M, int K,
     pack_A_tile_mrK(A_src, ldA, mr_eff, K, alpha, Ap);
   }
 
-  // pack B
+  // pack B (depends on NR choice)
 #pragma omp parallel for schedule(static)
   for (int tn = 0; tn < NT; ++tn) {
-    int j0 = tn * NR;
-    int nr_eff = std::min(NR, N - j0);
+    int j0 = tn * NRv;
+    int nr_eff = std::min(NRv, N - j0);
     const float* B_src = B + j0;
-    float* Bp = B_pack + (size_t)tn * K * NR;
-    pack_B_tile_Knr(B_src, ldB, K, nr_eff, Bp);
+    float* Bp = B_pack + (size_t)tn * K * NRv;
+    if (NRv == NR_48)      pack_B_tile_Knr_NR<NR_48>(B_src, ldB, K, nr_eff, Bp);
+    else /* NRv==32 */     pack_B_tile_Knr_NR<NR_32>(B_src, ldB, K, nr_eff, Bp);
   }
 
   if (beta == 0.0f) {
-    auto ker = jit_kernel_8x48_beta0_aligned();
+    auto ker = pick_jit(cfg);
 
 #pragma omp parallel
     {
-      // column-parallel assignment
 #pragma omp for schedule(static)
       for (int tn = 0; tn < NT; ++tn) {
-        int j0 = tn * NR;
-        const float* Bp = B_pack + (size_t)tn * K * NR;
+        int j0 = tn * NRv;
+        const float* Bp = B_pack + (size_t)tn * K * NRv;
 
         for (int tm = 0; tm < MT; ++tm) {
           int r0 = tm * MR;
           int mr_eff = std::min(MR, M - r0);
-          int nr_eff = std::min(NR, N - j0);
+          int nr_eff = std::min(NRv, N - j0);
           float* C_tile = C + (size_t)r0 * ldC + j0;
           const float* Ap = A_pack + (size_t)tm * K * MR;
 
-          if (mr_eff == MR && nr_eff == NR) {
-            int stream_flag = (aligned64(C_tile +  0) &&
-                               aligned64(C_tile + 16) &&
-                               aligned64(C_tile + 32)) ? 1 : 0;
+          if (mr_eff == MR && nr_eff == NRv) {
+            // NT if all output zmm-width segments are aligned
+            bool aligned_segments = true;
+            for (int b = 0; b < NBv; ++b)
+              aligned_segments &= aligned64(C_tile + b*16);
+            int stream_flag = aligned_segments ? 1 : 0;
             ker(Ap, Bp, C_tile, ldC, K, stream_flag);
           } else {
-            microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, 0.0f);
+            microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, 0.0f);
           }
         }
       }
       _mm_sfence(); // drain NT stores once per thread
     }
   } else {
+    // β ≠ 0 vector path specialized by NR choice
 #pragma omp parallel for schedule(static)
     for (int tn = 0; tn < NT; ++tn) {
-      int j0 = tn * NR;
-      const float* Bp = B_pack + (size_t)tn * K * NR;
+      int j0 = tn * NRv;
+      const float* Bp = B_pack + (size_t)tn * K * NRv;
 
       for (int tm = 0; tm < MT; ++tm) {
         int r0 = tm * MR;
         int mr_eff = std::min(MR, M - r0);
-        int nr_eff = std::min(NR, N - j0);
+        int nr_eff = std::min(NRv, N - j0);
         float* C_tile = C + (size_t)r0 * ldC + j0;
         const float* Ap = A_pack + (size_t)tm * K * MR;
 
-        if (mr_eff == MR && nr_eff == NR) {
-          __m512 acc0[MR], acc1[MR], acc2[MR];
-          for (int r = 0; r < MR; ++r) {
-            acc0[r] = _mm512_setzero_ps();
-            acc1[r] = _mm512_setzero_ps();
-            acc2[r] = _mm512_setzero_ps();
-          }
-          for (int kbase = 0; kbase < K; kbase += KC_L1) {
-            int Kc = std::min(KC_L1, K - kbase);
-            const float* a_ptr = Ap + (size_t)kbase * MR;
-            const float* b_ptr = Bp + (size_t)kbase * NR;
-            int k = 0, kend = Kc & ~1;
-            for (; k < kend; k += 2) {
-              // Prefetch future A/B rows (modest cadence)
-              int kpf = k + PF_KDIST_BETA;
-              if (kpf < Kc) {
-                _mm_prefetch(reinterpret_cast<const char*>(b_ptr + (size_t)kpf * NR), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(a_ptr + (size_t)kpf * MR), _MM_HINT_T0);
-              }
-
-              const float* bk = b_ptr + (size_t)k * NR;
-              __m512 bk0 = _mm512_load_ps(bk +  0);
-              __m512 bk1 = _mm512_load_ps(bk + 16);
-              __m512 bk2 = _mm512_load_ps(bk + 32);
-              const float* b1 = bk + NR;
-              __m512 b10 = _mm512_load_ps(b1 +  0);
-              __m512 b11 = _mm512_load_ps(b1 + 16);
-              __m512 b12 = _mm512_load_ps(b1 + 32);
-              for (int r = 0; r < MR; ++r) {
-                __m512 A0 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + r));
-                acc0[r] = _mm512_fmadd_ps(A0, bk0, acc0[r]);
-                acc1[r] = _mm512_fmadd_ps(A0, bk1, acc1[r]);
-                acc2[r] = _mm512_fmadd_ps(A0, bk2, acc2[r]);
-                __m512 A1 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + MR + r));
-                acc0[r] = _mm512_fmadd_ps(A1, b10, acc0[r]);
-                acc1[r] = _mm512_fmadd_ps(A1, b11, acc1[r]);
-                acc2[r] = _mm512_fmadd_ps(A1, b12, acc2[r]);
-              }
-              a_ptr += (size_t)2 * MR;
-            }
-            for (; k < Kc; ++k) {
-              int kpf = k + PF_KDIST_BETA;
-              if (kpf < Kc) {
-                _mm_prefetch(reinterpret_cast<const char*>(b_ptr + (size_t)kpf * NR), _MM_HINT_T0);
-                _mm_prefetch(reinterpret_cast<const char*>(a_ptr + (size_t)kpf * MR), _MM_HINT_T0);
-              }
-              const float* bk = b_ptr + (size_t)k * NR;
-              __m512 B0 = _mm512_load_ps(bk +  0);
-              __m512 B1 = _mm512_load_ps(bk + 16);
-              __m512 B2 = _mm512_load_ps(bk + 32);
-              for (int r = 0; r < MR; ++r) {
-                __m512 A0 = _mm512_broadcastss_ps(_mm_load_ss(a_ptr + r));
-                acc0[r] = _mm512_fmadd_ps(A0, B0, acc0[r]);
-                acc1[r] = _mm512_fmadd_ps(A0, B1, acc1[r]);
-                acc2[r] = _mm512_fmadd_ps(A0, B2, acc2[r]);
-              }
-              a_ptr += MR;
-            }
-          }
-
-          // Warm C just before read/modify/write
-          for (int r = 0; r < MR; ++r) {
-            float* cptr = C_tile + (size_t)r * ldC;
-            _mm_prefetch(reinterpret_cast<const char*>(cptr +  0), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(cptr + 16), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(cptr + 32), _MM_HINT_T0);
-          }
-
-          __m512 vb = _mm512_set1_ps(beta);
-          for (int r = 0; r < MR; ++r) {
-            float* cptr = C_tile + (size_t)r * ldC;
-            __m512 c0 = _mm512_loadu_ps(cptr +  0);
-            __m512 c1 = _mm512_loadu_ps(cptr + 16);
-            __m512 c2 = _mm512_loadu_ps(cptr + 32);
-            _mm512_storeu_ps(cptr +  0, _mm512_fmadd_ps(c0, vb, acc0[r]));
-            _mm512_storeu_ps(cptr + 16, _mm512_fmadd_ps(c1, vb, acc1[r]));
-            _mm512_storeu_ps(cptr + 32, _mm512_fmadd_ps(c2, vb, acc2[r]));
-          }
+        if (mr_eff == MR && nr_eff == NRv) {
+          if (NRv == NR_48)
+            beta_not_zero_fulltile_intrinsics<NR_48, /*KC_L1*/896>(Ap, Bp, C_tile, ldC, K, beta);
+          else
+            beta_not_zero_fulltile_intrinsics<NR_32, /*KC_L1*/896>(Ap, Bp, C_tile, ldC, K, beta);
+          // (KC for β≠0 here only affects prefetch cadence; 896 is a safe default)
         } else {
-          microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, beta);
+          microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, beta);
         }
       }
     }
@@ -455,6 +645,22 @@ void gemm_blocked_jit(const float* A, int M, int K,
 
   aligned_free64(B_pack);
   aligned_free64(A_pack);
+}
+
+// ============================== Public API ===========================
+void gemm_blocked_jit(const float* A, int M, int K,
+                      const float* B, int N,
+                      float* C,
+                      float alpha, float beta)
+{
+  std::call_once(g_once, [&](){
+    select_default_cfg();        // fallback
+    autotune_once(A, M, K, B, N, C);
+    // (Optional) print which config was chosen:
+    std::cout << "[GEMM] Tuned config: " << cfg_str(g_cfg) << std::endl;
+  });
+
+  gemm_blocked_jit_impl(A, M, K, B, N, C, alpha, beta, g_cfg);
 }
 
 } // namespace gemm
