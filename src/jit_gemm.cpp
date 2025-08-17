@@ -1,6 +1,6 @@
 // jit_gemm.cpp — AVX-512 SGEMM with Xbyak JIT micro-kernels
 // Baseline: prefetching + asymmetric one-shot autotune of (NR, UNROLL, KC_L1), cached.
-// NR ∈ {48, 32, 16} with UNROLL filtered by register feasibility.
+// Now with robust AVX-512 MASKED TAIL micro-kernel (no scalar fallback).
 //
 // Build: g++ -O3 -march=native -fopenmp -Ithird_party/xbyak -c src/jit_gemm.cpp
 // Optional: -DSTRICT_NUMERICS=1 to process full K in one pass (no panel split).
@@ -17,7 +17,6 @@
 #include <limits>
 #include <cstdio>
 #include <omp.h>
-#include <iostream>
 #if defined(__linux__)
   #include <sys/mman.h>
 #endif
@@ -93,9 +92,8 @@ static inline void pack_B_tile_Knr_NR(const float* __restrict B, int ldB,
 
     if constexpr (PF_PACKERS) {
       int k_pf = k + 8;
-      if (k_pf < K) {
+      if (k_pf < K)
         _mm_prefetch(reinterpret_cast<const char*>(B + (size_t)k_pf * ldB), _MM_HINT_T0);
-      }
     }
 
     int j = 0;
@@ -104,25 +102,76 @@ static inline void pack_B_tile_Knr_NR(const float* __restrict B, int ldB,
   }
 }
 
-// ===================== Tails / β!=0 portable path ====================
-static inline void microkernel_tail_scalar(
-    const float* __restrict Ap, const float* __restrict Bp,
+// ================= AVX-512 MASKED tail micro-kernel (β 0/≠0) =================
+static inline __mmask16 mask_upto(int n) {
+  return n >= 16 ? (__mmask16)0xFFFF : (__mmask16)((n <= 0) ? 0 : ((1u << n) - 1));
+}
+
+// Handles ANY mr_eff ∈ [1..MR], nr_eff ∈ [1..NR_stride]
+static inline void microkernel_tail_avx512(
+    const float* __restrict Ap,  // packed A: [K x MR]
+    const float* __restrict Bp,  // packed B: [K x NR_stride]
     float* __restrict C, int ldc,
     int K, int mr_eff, int nr_eff, int NR_stride, float beta)
 {
-  for (int r = 0; r < mr_eff; ++r) {
-    for (int j = 0; j < nr_eff; ++j) {
-      float acc = 0.f;
-      for (int kk = 0; kk < K; ++kk)
-        acc += Ap[(size_t)kk*MR + r] * Bp[(size_t)kk*NR_stride + j];
-      float* cptr = C + (size_t)r * ldc + j;
-      if (beta == 0.0f) *cptr = acc;
-      else if (beta == 1.0f) *cptr += acc;
-      else *cptr = acc + beta * (*cptr);
+  const int full_blocks = nr_eff / 16;
+  const int rem         = nr_eff % 16;
+  const __mmask16 kfull = (__mmask16)0xFFFF;
+  const __mmask16 krem  = mask_upto(rem);
+
+  // Max NB is 3 (NR_stride ∈ {16,32,48}), but we only use what we need.
+  __m512 acc[MR][3];
+  for (int r = 0; r < MR; ++r)
+    for (int b = 0; b < 3; ++b)
+      acc[r][b] = _mm512_setzero_ps();
+
+  for (int k = 0; k < K; ++k) {
+    const float* bk = Bp + (size_t)k * NR_stride;
+
+    // Load B blocks (mask the last one if needed)
+    __m512 Bblk[3];
+    for (int b = 0; b < full_blocks; ++b)
+      Bblk[b] = _mm512_load_ps(bk + b*16);
+    if (rem)
+      Bblk[full_blocks] = _mm512_maskz_loadu_ps(krem, bk + full_blocks*16);
+
+    // FMAs
+    const float* arow = Ap + (size_t)k * MR;
+    for (int r = 0; r < mr_eff; ++r) {
+      __m512 A0 = _mm512_broadcastss_ps(_mm_load_ss(arow + r));
+      for (int b = 0; b < full_blocks; ++b)
+        acc[r][b] = _mm512_fmadd_ps(A0, Bblk[b], acc[r][b]);
+      if (rem)
+        acc[r][full_blocks] = _mm512_fmadd_ps(A0, Bblk[full_blocks], acc[r][full_blocks]);
+    }
+  }
+
+  if (beta == 0.0f) {
+    for (int r = 0; r < mr_eff; ++r) {
+      float* cptr = C + (size_t)r * ldc;
+      for (int b = 0; b < full_blocks; ++b)
+        _mm512_storeu_ps(cptr + b*16, acc[r][b]);
+      if (rem)
+        _mm512_mask_storeu_ps(cptr + full_blocks*16, krem, acc[r][full_blocks]);
+    }
+  } else {
+    __m512 vb = _mm512_set1_ps(beta);
+    for (int r = 0; r < mr_eff; ++r) {
+      float* cptr = C + (size_t)r * ldc;
+      for (int b = 0; b < full_blocks; ++b) {
+        __m512 c = _mm512_loadu_ps(cptr + b*16);
+        _mm512_storeu_ps(cptr + b*16, _mm512_fmadd_ps(c, vb, acc[r][b]));
+      }
+      if (rem) {
+        __m512 c = _mm512_mask_loadu_ps(_mm512_setzero_ps(), krem, cptr + full_blocks*16);
+        __m512 v = _mm512_fmadd_ps(c, vb, acc[r][full_blocks]);
+        _mm512_mask_storeu_ps(cptr + full_blocks*16, krem, v);
+      }
     }
   }
 }
 
+// ================== β≠0 full-tile vector path (unchanged) =====================
 template<int NR, int KC_L1>
 static inline void beta_not_zero_fulltile_intrinsics(
     const float* __restrict Ap, const float* __restrict Bp,
@@ -455,7 +504,7 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
                                   float alpha, float beta,
                                   const KernelConfig& cfg);
 
-// Autotune: try asymmetric, feasible grid on first call
+// Autotune: asymmetric, feasible grid on first call
 static void autotune_once(const float* A, int M, int K,
                           const float* B, int N,
                           float* C)
@@ -652,7 +701,7 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
             int stream_flag = aligned_segments ? 1 : 0;
             ker(Ap, Bp, C_tile, ldC, K, stream_flag);
           } else {
-            microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, 0.0f);
+            microkernel_tail_avx512(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, 0.0f);
           }
         }
       }
@@ -677,7 +726,7 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
           else if (NRv == NR_32) beta_not_zero_fulltile_intrinsics<NR_32,896>(Ap, Bp, C_tile, ldC, K, beta);
           else                   beta_not_zero_fulltile_intrinsics<NR_16,896>(Ap, Bp, C_tile, ldC, K, beta);
         } else {
-          microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, beta);
+          microkernel_tail_avx512(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, beta);
         }
       }
     }
@@ -693,11 +742,12 @@ void gemm_blocked_jit(const float* A, int M, int K,
                       float* C,
                       float alpha, float beta)
 {
-  static std::once_flag g_once;
-  std::call_once(g_once, [&](){
+  static std::once_flag once;
+  std::call_once(once, [&](){
     select_default_cfg();
     autotune_once(A, M, K, B, N, C);
-    std::cout << "[GEMM] Tuned config: " << cfg_str(g_cfg) << std::endl;
+    
+    // fprintf(stderr, "[GEMM] Tuned config: %s\n", cfg_str(g_cfg));
   });
 
   gemm_blocked_jit_impl(A, M, K, B, N, C, alpha, beta, g_cfg);
