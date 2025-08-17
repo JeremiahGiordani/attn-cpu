@@ -1,8 +1,9 @@
 // jit_gemm.cpp — AVX-512 SGEMM with Xbyak JIT micro-kernels
-// Baseline: prefetching + one-shot autotune of (NR, K_UNROLL, KC_L1), cached.
+// Baseline: prefetching + asymmetric one-shot autotune of (NR, UNROLL, KC_L1), cached.
+// NR ∈ {48, 32, 16} with UNROLL filtered by register feasibility.
 //
 // Build: g++ -O3 -march=native -fopenmp -Ithird_party/xbyak -c src/jit_gemm.cpp
-// Macros: -DSTRICT_NUMERICS=1 to disable K panel split inside kernels.
+// Optional: -DSTRICT_NUMERICS=1 to process full K in one pass (no panel split).
 
 #include <immintrin.h>
 #include <algorithm>
@@ -13,6 +14,8 @@
 #include <mutex>
 #include <array>
 #include <atomic>
+#include <limits>
+#include <cstdio>
 #include <omp.h>
 #include <iostream>
 #if defined(__linux__)
@@ -23,21 +26,16 @@
 namespace gemm {
 
 // ===================== Tunables (prefetch-only) ======================
-static constexpr int PF_DIST_ITER_U2 = 2;  // JIT k-loop (k-unroll=2) lookahead
+static constexpr int PF_DIST_ITER_U2 = 2;  // JIT k-loop (k-unroll>=2) lookahead
 static constexpr int PF_DIST_ITER_U1 = 4;  // JIT tail (k-unroll=1) lookahead
 static constexpr int PF_KDIST_BETA   = 16; // β≠0 path prefetch distance
 static constexpr bool PF_PACKERS     = true;
 
 // ============================ Blocking ===============================
-static constexpr int MR = 8;          // fixed (register-row block)
+static constexpr int MR   = 8;           // register row block
 static constexpr int NR_48 = 48;
 static constexpr int NR_32 = 32;
-
-#ifndef STRICT_NUMERICS
-// KC_L1 is baked into the JIT micro-kernel (panel split inside kernel)
-#else
-// If STRICT_NUMERICS, KC_L1 becomes effectively huge (one pass)
-#endif
+static constexpr int NR_16 = 16;
 
 // ============================ Utilities ==============================
 static inline float* aligned_alloc64(size_t n_floats) {
@@ -130,7 +128,7 @@ static inline void beta_not_zero_fulltile_intrinsics(
     const float* __restrict Ap, const float* __restrict Bp,
     float* __restrict C_tile, int ldC, int K, float beta)
 {
-  constexpr int NB = NR / 16; // 2 for 32, 3 for 48
+  constexpr int NB = NR / 16;
   __m512 acc[MR][NB];
   for (int r = 0; r < MR; ++r)
     for (int b = 0; b < NB; ++b)
@@ -143,7 +141,6 @@ static inline void beta_not_zero_fulltile_intrinsics(
 
     int k = 0, kend = Kc & ~1;
     for (; k < kend; k += 2) {
-      // Prefetch modestly ahead
       int kpf = k + PF_KDIST_BETA;
       if (kpf < Kc) {
         _mm_prefetch(reinterpret_cast<const char*>(b_ptr + (size_t)kpf * NR), _MM_HINT_T0);
@@ -206,7 +203,7 @@ static inline void beta_not_zero_fulltile_intrinsics(
 }
 
 // ================== JIT micro-kernels (beta==0, aligned B) ===========
-// Generic generator for NR ∈ {32,48}, UNROLL ∈ {1,2}, KC_L1 baked in.
+// Generic generator for NR ∈ {16,32,48}, UNROLL ∈ {1..8}, KC_L1 baked in.
 template<int NR, int UNROLL, int KC_L1>
 struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
   using Fn = void(*)(const float*, const float*, float*, int, int, int);
@@ -214,10 +211,10 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
     using namespace Xbyak;
 
     constexpr int NB = NR / 16;
-    // Register budget: acc = MR*NB, B regs = NB*UNROLL, 2 broadcast
-    static_assert(NB == 2 || NB == 3, "NR must be 32 or 48");
-    static_assert(UNROLL == 1 || UNROLL == 2, "UNROLL must be 1 or 2");
-    static_assert(MR*NB + NB*UNROLL + 2 <= 32, "AVX-512 zmm register pressure!");
+    // Register budget: accumulators + B regs; keep zmm30/31 free for broadcast
+    static_assert(NB >= 1 && NB <= 3, "NR must be 16, 32, or 48");
+    static_assert(UNROLL >= 1 && UNROLL <= 8, "UNROLL out of supported range");
+    static_assert(MR*NB + NB*UNROLL <= 30, "Register pressure too high (keep zmm30/31 free)");
 
     const Reg64 Ap = rdi, Bp = rsi, C = rdx, ldc = rcx, K = r8, stream = r9;
     const Reg64 kbase = r10, a_ptr = r11, b_ptr = r12, c_row = r13, ldc_bytes = r14;
@@ -267,11 +264,11 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
         cmp(kcnt, UNROLL);
         jl(L_panel_tail, T_NEAR);
 
-        // Prefetch next bodies for UNROLL=2; for UNROLL=1 we still use PF_U1 below
-        if (UNROLL == 2) {
+        // Prefetch next bodies for UNROLL>=2; for UNROLL=1 we use PF_U1 below
+        if (UNROLL >= 2) {
           if (BPF_U2 > 0) {
             prefetcht0(ptr[b_ptr + BPF_U2]);
-            if (NB >= 1) prefetcht0(ptr[b_ptr + BPF_U2 + NR*4]);
+            if ((NR/16) >= 1) prefetcht0(ptr[b_ptr + BPF_U2 + NR*4]);
           }
           if (APF_U2 > 0) {
             prefetcht0(ptr[a_ptr + APF_U2]);
@@ -279,23 +276,20 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
         }
 
         // Load B rows for UNROLL steps
-        // We place B regs AFTER accumulators: baseB = MR*NB
-        const int baseB = MR*NB;
-        // emit loads for iter t in [0..UNROLL-1]
+        const int baseB = MR*(NR/16); // B regs start after accumulators
         for (int t = 0; t < UNROLL; ++t) {
-          for (int b = 0; b < NB; ++b) {
-            vmovaps(Zmm(baseB + t*NB + b), ptr[b_ptr + (t*NR + b*16)*4]);
+          for (int b = 0; b < (NR/16); ++b) {
+            vmovaps(Zmm(baseB + t*(NR/16) + b), ptr[b_ptr + (t*NR + b*16)*4]);
           }
         }
 
         // FMAs
         for (int r = 0; r < MR; ++r) {
-          // For each UNROLL step
           for (int t = 0; t < UNROLL; ++t) {
             vbroadcastss(Zmm(30), ptr[a_ptr + (t*MR + r)*4]);
-            for (int b = 0; b < NB; ++b) {
-              // acc index layout: acc[b][r] -> zmm(b*MR + r)
-              vfmadd231ps(Zmm(b*MR + r), Zmm(baseB + t*NB + b), Zmm(30));
+            for (int b = 0; b < (NR/16); ++b) {
+              // acc[b][r] -> zmm(b*MR + r)
+              vfmadd231ps(Zmm(b*MR + r), Zmm(baseB + t*(NR/16) + b), Zmm(30));
             }
           }
         }
@@ -313,13 +307,13 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
         if (APF_U1 > 0) prefetcht0(ptr[a_ptr + APF_U1]);
 
         // Load single B row (tail)
-        for (int b = 0; b < NB; ++b) {
-          vmovaps(Zmm(MR*NB + b), ptr[b_ptr + b*16*4]);
+        for (int b = 0; b < (NR/16); ++b) {
+          vmovaps(Zmm(MR*(NR/16) + b), ptr[b_ptr + b*16*4]);
         }
         for (int r = 0; r < MR; ++r) {
           vbroadcastss(Zmm(31), ptr[a_ptr + r*4]);
-          for (int b = 0; b < NB; ++b) {
-            vfmadd231ps(Zmm(b*MR + r), Zmm(MR*NB + b), Zmm(31));
+          for (int b = 0; b < (NR/16); ++b) {
+            vfmadd231ps(Zmm(b*MR + r), Zmm(MR*(NR/16) + b), Zmm(31));
           }
         }
       L(L_panel_done);
@@ -337,7 +331,7 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
     for (int r = 0; r < MR; ++r) {
       mov(c_row, C);
       if (r != 0) { mov(tmp, ldc_bytes); imul(tmp, tmp, r); add(c_row, tmp); }
-      for (int b = 0; b < NB; ++b) {
+      for (int b = 0; b < (NR/16); ++b) {
         vmovntps(ptr[c_row + (b*16)*4], Zmm(b*MR + r));
       }
     }
@@ -347,7 +341,7 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
     for (int r = 0; r < MR; ++r) {
       mov(c_row, C);
       if (r != 0) { mov(tmp, ldc_bytes); imul(tmp, tmp, r); add(c_row, tmp); }
-      for (int b = 0; b < NB; ++b) {
+      for (int b = 0; b < (NR/16); ++b) {
         vmovups(ptr[c_row + (b*16)*4], Zmm(b*MR + r));
       }
     }
@@ -363,19 +357,71 @@ struct Jit8xNR_Beta0 final : public Xbyak::CodeGenerator {
 };
 
 // -------- JIT kernel factory (lazy singletons per config) -------------
-enum : int { UNR1 = 1, UNR2 = 2 };
-
 template<int NR, int UNROLL, int KC_L1>
 static typename Jit8xNR_Beta0<NR,UNROLL,KC_L1>::Fn get_jit_kernel() {
   static Jit8xNR_Beta0<NR,UNROLL,KC_L1> gen;
   return gen.get();
 }
 
+enum : int { UNR_MIN=1, UNR_MAX=8 };
+
+template<int NR, int UNROLL>
+static inline auto pick_by_kc(int kc)->typename Jit8xNR_Beta0<NR,UNROLL,768>::Fn {
+#ifndef STRICT_NUMERICS
+  switch (kc) {
+    case 640: return get_jit_kernel<NR,UNROLL,640>();
+    case 768: return get_jit_kernel<NR,UNROLL,768>();
+    default:  return get_jit_kernel<NR,UNROLL,896>();
+  }
+#else
+  constexpr int KCHuge = (1<<30);
+  (void)kc;
+  return get_jit_kernel<NR,UNROLL,KCHuge>();
+#endif
+}
+
+// NR-specific dispatcher that ONLY instantiates feasible UNROLL values
+static inline auto pick_jit(int NR, int UNROLL, int KC_L1)
+  -> typename Jit8xNR_Beta0<NR_48,1,768>::Fn
+{
+  using Fn = typename Jit8xNR_Beta0<NR_48,1,768>::Fn;
+  switch (NR) {
+    case NR_48:
+      switch (UNROLL) {
+        case 1: return (Fn)pick_by_kc<NR_48,1>(KC_L1);
+        case 2: return (Fn)pick_by_kc<NR_48,2>(KC_L1);
+        default: return (Fn)pick_by_kc<NR_48,1>(KC_L1);
+      }
+    case NR_32:
+      switch (UNROLL) {
+        case 1: return (Fn)pick_by_kc<NR_32,1>(KC_L1);
+        case 2: return (Fn)pick_by_kc<NR_32,2>(KC_L1);
+        case 3: return (Fn)pick_by_kc<NR_32,3>(KC_L1);
+        case 4: return (Fn)pick_by_kc<NR_32,4>(KC_L1);
+        default: return (Fn)pick_by_kc<NR_32,2>(KC_L1);
+      }
+    case NR_16:
+      switch (UNROLL) {
+        case 1: return (Fn)pick_by_kc<NR_16,1>(KC_L1);
+        case 2: return (Fn)pick_by_kc<NR_16,2>(KC_L1);
+        case 3: return (Fn)pick_by_kc<NR_16,3>(KC_L1);
+        case 4: return (Fn)pick_by_kc<NR_16,4>(KC_L1);
+        case 5: return (Fn)pick_by_kc<NR_16,5>(KC_L1);
+        case 6: return (Fn)pick_by_kc<NR_16,6>(KC_L1);
+        case 7: return (Fn)pick_by_kc<NR_16,7>(KC_L1);
+        case 8: return (Fn)pick_by_kc<NR_16,8>(KC_L1);
+        default: return (Fn)pick_by_kc<NR_16,4>(KC_L1);
+      }
+    default:
+      return (Fn)pick_by_kc<NR_48,1>(KC_L1);
+  }
+}
+
 // =================== Config, tuner, and dispatcher ====================
 struct KernelConfig {
-  int NR;        // 32 or 48
-  int UNROLL;    // 1 or 2
-  int KC_L1;     // 640,768,896 (or large if STRICT_NUMERICS)
+  int NR;        // 16, 32, or 48
+  int UNROLL;    // 1..8 (feasible combos only)
+  int KC_L1;     // 640, 768, 896 (or huge if STRICT_NUMERICS)
 };
 
 static inline const char* cfg_str(const KernelConfig& c) {
@@ -389,37 +435,41 @@ static std::once_flag g_once;
 
 static inline void select_default_cfg() {
 #ifndef STRICT_NUMERICS
-  g_cfg = {NR_48, UNR2, 768};
+  g_cfg = {NR_48, 1, 768};
 #else
-  g_cfg = {NR_48, UNR2, (1<<30)};
+  g_cfg = {NR_48, 1, (1<<30)};
 #endif
 }
 
-// Forward decl of the configurable implementation used for timing
+static inline bool feasible_combo(int NR, int UNROLL) {
+  int NB = NR / 16;
+  // Keep zmm30/31 free: MR*NB + NB*UNROLL <= 30
+  return (MR*NB + NB*UNROLL) <= 30 && UNROLL >= 1 && UNROLL <= 8;
+}
+
+// Forward decl
 static void gemm_blocked_jit_impl(const float* A, int M, int K,
                                   const float* B, int N, float* C,
                                   float alpha, float beta,
                                   const KernelConfig& cfg);
 
-// Autotune: try a small grid, pick the fastest on the *actual* M,N,K
+// Autotune: try asymmetric, feasible grid on first call
 static void autotune_once(const float* A, int M, int K,
                           const float* B, int N,
                           float* C)
 {
-  // Candidate grid (conservative)
 #ifndef STRICT_NUMERICS
   static constexpr int KCs[] = {640, 768, 896};
 #else
   static constexpr int KCs[] = {(1<<30)};
 #endif
-  static constexpr int NRs[] = {NR_48, NR_32};
-  static constexpr int UNRs[] = {UNR2, UNR1};
+  static constexpr int NRs[] = {NR_48, NR_32, NR_16};
 
   double best_t = std::numeric_limits<double>::infinity();
   KernelConfig best{};
   bool found = false;
 
-  // Make scratch copies so we don't corrupt user buffers during timing
+  // Scratch copies for timing (beta=0)
   const int ldA = K, ldB = N, ldC = N;
   size_t sizeA = (size_t)M * ldA;
   size_t sizeB = (size_t)K * ldB;
@@ -428,7 +478,7 @@ static void autotune_once(const float* A, int M, int K,
   float* A_s = aligned_alloc64(sizeA);
   float* B_s = aligned_alloc64(sizeB);
   float* C_s = aligned_alloc64(sizeC);
-  if (!A_s || !B_s || !C_s) { // fallback to default if allocation fails
+  if (!A_s || !B_s || !C_s) {
     if (A_s) aligned_free64(A_s);
     if (B_s) aligned_free64(B_s);
     if (C_s) aligned_free64(C_s);
@@ -439,32 +489,71 @@ static void autotune_once(const float* A, int M, int K,
   std::memcpy(B_s, B, sizeB * sizeof(float));
   std::memset(C_s, 0, sizeC * sizeof(float));
 
-  // Small warmup & timed loops
   for (int NRv : NRs) {
-    for (int UNv : UNRs) {
-      for (int KCv : KCs) {
-        KernelConfig cfg{NRv, UNv, KCv};
+    if (NRv == NR_48) {
+      for (int UNv : {1,2}) {
+        if (!feasible_combo(NRv, UNv)) continue;
+        for (int KCv : KCs) {
+          KernelConfig cfg{NRv, UNv, KCv};
 
-        // one warmup (beta=0 path), re-zero C each time
-        std::memset(C_s, 0, sizeC * sizeof(float));
-        gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
-
-        // 3 timed runs
-        const int RUNS = 3;
-        double tsum = 0.0;
-        for (int r = 0; r < RUNS; ++r) {
           std::memset(C_s, 0, sizeC * sizeof(float));
-          double t0 = omp_get_wtime();
           gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
-          double t1 = omp_get_wtime();
-          tsum += (t1 - t0);
-        }
-        double tavg = tsum / RUNS;
 
-        if (tavg < best_t) {
-          best_t = tavg;
-          best = cfg;
-          found = true;
+          const int RUNS = 3;
+          double tsum = 0.0;
+          for (int r = 0; r < RUNS; ++r) {
+            std::memset(C_s, 0, sizeC * sizeof(float));
+            double t0 = omp_get_wtime();
+            gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+            double t1 = omp_get_wtime();
+            tsum += (t1 - t0);
+          }
+          double tavg = tsum / RUNS;
+          if (tavg < best_t) { best_t = tavg; best = cfg; found = true; }
+        }
+      }
+    } else if (NRv == NR_32) {
+      for (int UNv : {1,2,3,4}) {
+        if (!feasible_combo(NRv, UNv)) continue;
+        for (int KCv : KCs) {
+          KernelConfig cfg{NRv, UNv, KCv};
+
+          std::memset(C_s, 0, sizeC * sizeof(float));
+          gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+
+          const int RUNS = 3;
+          double tsum = 0.0;
+          for (int r = 0; r < RUNS; ++r) {
+            std::memset(C_s, 0, sizeC * sizeof(float));
+            double t0 = omp_get_wtime();
+            gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+            double t1 = omp_get_wtime();
+            tsum += (t1 - t0);
+          }
+          double tavg = tsum / RUNS;
+          if (tavg < best_t) { best_t = tavg; best = cfg; found = true; }
+        }
+      }
+    } else { // NR_16
+      for (int UNv : {1,2,3,4,5,6,7,8}) {
+        if (!feasible_combo(NRv, UNv)) continue;
+        for (int KCv : KCs) {
+          KernelConfig cfg{NRv, UNv, KCv};
+
+          std::memset(C_s, 0, sizeC * sizeof(float));
+          gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+
+          const int RUNS = 3;
+          double tsum = 0.0;
+          for (int r = 0; r < RUNS; ++r) {
+            std::memset(C_s, 0, sizeC * sizeof(float));
+            double t0 = omp_get_wtime();
+            gemm_blocked_jit_impl(A_s, M, K, B_s, N, C_s, 1.0f, 0.0f, cfg);
+            double t1 = omp_get_wtime();
+            tsum += (t1 - t0);
+          }
+          double tavg = tsum / RUNS;
+          if (tavg < best_t) { best_t = tavg; best = cfg; found = true; }
         }
       }
     }
@@ -479,57 +568,8 @@ static void autotune_once(const float* A, int M, int K,
 }
 
 // ================= Configurable dispatcher implementation =============
-template<int NR, int UNROLL, int KC_L1>
-static inline typename Jit8xNR_Beta0<NR,UNROLL,KC_L1>::Fn pick_jit_ptr() {
-  return get_jit_kernel<NR,UNROLL,KC_L1>();
-}
+static inline int nb_blocks_for(int NR) { return NR/16; }
 
-static inline auto pick_jit(const KernelConfig& cfg) {
-  using Fn = typename Jit8xNR_Beta0<NR_48,UNR2,768>::Fn;
-#ifndef STRICT_NUMERICS
-  switch (cfg.NR) {
-    case NR_48:
-      if (cfg.UNROLL == UNR2) {
-        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_48,UNR2,640>();
-        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_48,UNR2,768>();
-        return (Fn)pick_jit_ptr<NR_48,UNR2,896>();
-      } else {
-        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_48,UNR1,640>();
-        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_48,UNR1,768>();
-        return (Fn)pick_jit_ptr<NR_48,UNR1,896>();
-      }
-    case NR_32:
-      if (cfg.UNROLL == UNR2) {
-        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_32,UNR2,640>();
-        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_32,UNR2,768>();
-        return (Fn)pick_jit_ptr<NR_32,UNR2,896>();
-      } else {
-        if (cfg.KC_L1 == 640) return (Fn)pick_jit_ptr<NR_32,UNR1,640>();
-        if (cfg.KC_L1 == 768) return (Fn)pick_jit_ptr<NR_32,UNR1,768>();
-        return (Fn)pick_jit_ptr<NR_32,UNR1,896>();
-      }
-    default: // fallback
-      return (Fn)pick_jit_ptr<NR_48,UNR2,768>();
-  }
-#else
-  // STRICT_NUMERICS: no panel split
-  constexpr int KCHuge = (1<<30);
-  switch (cfg.NR) {
-    case NR_48:
-      return (cfg.UNROLL==UNR2) ? (Fn)pick_jit_ptr<NR_48,UNR2,KCHuge>()
-                                : (Fn)pick_jit_ptr<NR_48,UNR1,KCHuge>();
-    case NR_32:
-      return (cfg.UNROLL==UNR2) ? (Fn)pick_jit_ptr<NR_32,UNR2,KCHuge>()
-                                : (Fn)pick_jit_ptr<NR_32,UNR1,KCHuge>();
-    default:
-      return (Fn)pick_jit_ptr<NR_48,UNR2,KCHuge>();
-  }
-#endif
-}
-
-static inline int nr_blocks_for(int NR) { return NR/16; }
-
-// Main configurable implementation (used by both autotuner and API)
 static void gemm_blocked_jit_impl(const float* A, int M, int K,
                                   const float* B, int N,
                                   float* C,
@@ -540,7 +580,7 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
 
   const int ldA = K, ldB = N, ldC = N;
   const int NRv  = cfg.NR;
-  const int NBv  = nr_blocks_for(NRv);
+  const int NBv  = nb_blocks_for(NRv);
 
   if (alpha == 0.0f) {
 #pragma omp parallel for schedule(static)
@@ -581,12 +621,13 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
     int nr_eff = std::min(NRv, N - j0);
     const float* B_src = B + j0;
     float* Bp = B_pack + (size_t)tn * K * NRv;
-    if (NRv == NR_48)      pack_B_tile_Knr_NR<NR_48>(B_src, ldB, K, nr_eff, Bp);
-    else /* NRv==32 */     pack_B_tile_Knr_NR<NR_32>(B_src, ldB, K, nr_eff, Bp);
+    if      (NRv == NR_48) pack_B_tile_Knr_NR<NR_48>(B_src, ldB, K, nr_eff, Bp);
+    else if (NRv == NR_32) pack_B_tile_Knr_NR<NR_32>(B_src, ldB, K, nr_eff, Bp);
+    else                   pack_B_tile_Knr_NR<NR_16>(B_src, ldB, K, nr_eff, Bp);
   }
 
   if (beta == 0.0f) {
-    auto ker = pick_jit(cfg);
+    auto ker = pick_jit(cfg.NR, cfg.UNROLL, cfg.KC_L1);
 
 #pragma omp parallel
     {
@@ -603,7 +644,6 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
           const float* Ap = A_pack + (size_t)tm * K * MR;
 
           if (mr_eff == MR && nr_eff == NRv) {
-            // NT if all output zmm-width segments are aligned
             bool aligned_segments = true;
             for (int b = 0; b < NBv; ++b)
               aligned_segments &= aligned64(C_tile + b*16);
@@ -617,7 +657,6 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
       _mm_sfence(); // drain NT stores once per thread
     }
   } else {
-    // β ≠ 0 vector path specialized by NR choice
 #pragma omp parallel for schedule(static)
     for (int tn = 0; tn < NT; ++tn) {
       int j0 = tn * NRv;
@@ -631,11 +670,10 @@ static void gemm_blocked_jit_impl(const float* A, int M, int K,
         const float* Ap = A_pack + (size_t)tm * K * MR;
 
         if (mr_eff == MR && nr_eff == NRv) {
-          if (NRv == NR_48)
-            beta_not_zero_fulltile_intrinsics<NR_48, /*KC_L1*/896>(Ap, Bp, C_tile, ldC, K, beta);
-          else
-            beta_not_zero_fulltile_intrinsics<NR_32, /*KC_L1*/896>(Ap, Bp, C_tile, ldC, K, beta);
-          // (KC for β≠0 here only affects prefetch cadence; 896 is a safe default)
+          // KC here influences only prefetch cadence; 896 is a safe default
+          if      (NRv == NR_48) beta_not_zero_fulltile_intrinsics<NR_48,896>(Ap, Bp, C_tile, ldC, K, beta);
+          else if (NRv == NR_32) beta_not_zero_fulltile_intrinsics<NR_32,896>(Ap, Bp, C_tile, ldC, K, beta);
+          else                   beta_not_zero_fulltile_intrinsics<NR_16,896>(Ap, Bp, C_tile, ldC, K, beta);
         } else {
           microkernel_tail_scalar(Ap, Bp, C_tile, ldC, K, mr_eff, nr_eff, NRv, beta);
         }
@@ -653,10 +691,10 @@ void gemm_blocked_jit(const float* A, int M, int K,
                       float* C,
                       float alpha, float beta)
 {
+  static std::once_flag g_once;
   std::call_once(g_once, [&](){
-    select_default_cfg();        // fallback
+    select_default_cfg();
     autotune_once(A, M, K, B, N, C);
-    // (Optional) print which config was chosen:
     std::cout << "[GEMM] Tuned config: " << cfg_str(g_cfg) << std::endl;
   });
 
