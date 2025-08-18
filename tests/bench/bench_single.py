@@ -11,8 +11,11 @@ from attn_cpu import gemm, gemm_jit
 # ----------------------------------------------------------------------
 # Experiment parameters
 # ----------------------------------------------------------------------
-M, K, N = 2048, 1280, 960
+M = 2048
+K = 1280
+N = 960
 N_RUNS = 20
+N_WARMUPS = 3
 SEED   = 42
 
 torch.manual_seed(SEED)
@@ -55,7 +58,7 @@ fns = {
 # ----------------------------------------------------------------------
 def timed_avg(fn, n=N_RUNS):
     # Warmup (3x). For JAX JIT this triggers compilation.
-    for _ in range(3):
+    for _ in range(N_WARMUPS):
         out = fn()
         # JAX returns lazy DeviceArray; block to measure fairly
         if hasattr(out, "block_until_ready"):
